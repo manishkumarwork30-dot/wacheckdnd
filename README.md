@@ -175,3 +175,5 @@ Example: a proxy on host A (`WORKER_BASE_URL` unused), workers on hosts B and C 
 
 - [ ] Add support for more Baileys features
 - [ ] Add unit testing
+#   w a c h e c k d n d  
+ 
