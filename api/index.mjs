@@ -505,7 +505,20 @@ function errorToString(error) {
 
 // src/lib/mongodb.ts
 import { MongoClient } from "mongodb";
+var client = null;
 var db = null;
+async function initializeMongo() {
+  if (db)
+    return db;
+  const mongoUrl = process.env.MONGO_URL || "mongodb://localhost:27017";
+  const dbName = "verification_db";
+  logger_default.info("Connecting to MongoDB...");
+  client = new MongoClient(mongoUrl);
+  await client.connect();
+  db = client.db(dbName);
+  logger_default.info("Connected to MongoDB");
+  return db;
+}
 function getDb() {
   if (!db) {
     throw new Error("Database not initialized. Call initializeMongo() first.");
@@ -5370,6 +5383,7 @@ var app_default = app;
 
 // src/vercel-entry.ts
 async function handler(request) {
+  await initializeMongo();
   return app_default.handle(request);
 }
 export {
