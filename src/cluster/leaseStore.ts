@@ -1,99 +1,139 @@
 import { instanceId } from "@/cluster/identity";
-import { clusterKeys } from "@/cluster/keys";
 import config from "@/config";
-import redis from "@/lib/redis";
+import { getDb } from "@/lib/mongodb";
 
-// A lease marks which instance currently owns a phone number's WhatsApp
-// socket. Stored as a JSON string under a TTL'd key; the owner renews it
-// periodically and self-fences (closes the socket) when renewal reports the
-// lease now belongs to someone else. The epoch strictly increases across
-// successive owners, so any consumer can order ownership transitions even
-// when events arrive late.
 export interface Lease {
   owner: string;
   epoch: number;
 }
 
-// Renewal outcomes are deliberately distinct from transport errors:
-// - "renewed": still the owner, TTL extended.
-// - "lost": the key exists but belongs to another instance — the caller must
-//   fence immediately (discard the socket, never write auth state again).
-// - "missing": the key vanished (TTL elapsed while we were degraded, or a
-//   Redis failover dropped it). The caller should attempt an immediate
-//   re-acquire: the previous owner nearly always wins that race because
-//   competitors only claim keys they observe as unleased on their next scan.
-// Redis transport errors are NOT mapped to these — they throw, and the caller
-// must treat them as "unknown", keeping the socket alive (see coordinator).
 export type RenewResult = "renewed" | "lost" | "missing";
 
-// Compare-owner renewal. Plain GET + PEXPIRE would race: between the two
-// commands the lease can expire and be re-acquired, and we would extend (and
-// believe we own) somebody else's lease.
-const RENEW_SCRIPT = `
-local raw = redis.call('GET', KEYS[1])
-if not raw then return -1 end
-local lease = cjson.decode(raw)
-if lease.owner ~= ARGV[1] then return 0 end
-redis.call('PEXPIRE', KEYS[1], ARGV[2])
-return 1
-`;
+interface LeaseDoc {
+  _id: string;
+  owner: string;
+  epoch: number;
+  expiresAt: Date;
+}
 
-// Compare-and-delete so a late release (e.g. a slow shutdown) cannot drop a
-// lease that has already moved on. Owner alone is not enough: the same
-// instance can re-acquire the phone (new epoch) while an older release is
-// still in flight, so the epoch must match too.
-const RELEASE_SCRIPT = `
-local raw = redis.call('GET', KEYS[1])
-if not raw then return 0 end
-local lease = cjson.decode(raw)
-if lease.owner ~= ARGV[1] then return 0 end
-if tostring(lease.epoch) ~= ARGV[2] then return 0 end
-redis.call('DEL', KEYS[1])
-return 1
-`;
+interface EpochDoc {
+  _id: string;
+  epoch: number;
+}
+
+interface CooldownDoc {
+  _id: string;
+  owner: string;
+  expiresAt: Date;
+}
+
+interface HandoffDoc {
+  _id: string;
+  target: string;
+  expiresAt: Date;
+}
 
 function leaseTtl() {
   return config.cluster.leaseTtlMs;
 }
 
-// Best-effort claim: wins only if the phone is currently unleased. The epoch
-// counter is bumped before the SET — a losing claim burns an epoch, which is
-// harmless (epochs only need to be monotonic, not dense).
-export async function acquireLease(phoneNumber: string): Promise<Lease | null> {
-  const epoch = await redis.incr(clusterKeys.leaseEpoch(phoneNumber));
-  const lease: Lease = { owner: instanceId, epoch };
-  const result = await redis.set(
-    clusterKeys.lease(phoneNumber),
-    JSON.stringify(lease),
-    {
-      condition: "NX",
-      expiration: { type: "PX", value: leaseTtl() },
-    },
+async function getNextEpoch(phoneNumber: string): Promise<number> {
+  const db = getDb();
+  const epochs = db.collection<EpochDoc>("lease_epochs");
+  const res = await epochs.findOneAndUpdate(
+    { _id: phoneNumber },
+    { $inc: { epoch: 1 } },
+    { upsert: true, returnDocument: "after" },
   );
-  return result ? lease : null;
+  return res && res.epoch ? res.epoch : 1;
 }
 
-// Unconditional takeover. Reserved for explicit user intent (POST
-// /connections) and for claiming from an owner that is verifiably dead —
-// never for background claims, which must go through acquireLease.
-export async function forceAcquireLease(phoneNumber: string): Promise<Lease> {
-  const epoch = await redis.incr(clusterKeys.leaseEpoch(phoneNumber));
+export async function acquireLease(phoneNumber: string): Promise<Lease | null> {
+  const db = getDb();
+  const leases = db.collection<LeaseDoc>("leases");
+  const epoch = await getNextEpoch(phoneNumber);
   const lease: Lease = { owner: instanceId, epoch };
-  await redis.set(clusterKeys.lease(phoneNumber), JSON.stringify(lease), {
-    expiration: { type: "PX", value: leaseTtl() },
-  });
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + leaseTtl());
+
+  // Try to update if expired
+  const updateRes = await leases.findOneAndUpdate(
+    {
+      _id: phoneNumber,
+      expiresAt: { $lt: now },
+    },
+    {
+      $set: {
+        owner: instanceId,
+        epoch,
+        expiresAt,
+      },
+    },
+    { returnDocument: "after" },
+  );
+
+  if (updateRes) {
+    return lease;
+  }
+
+  // Otherwise, try to insert new lease
+  try {
+    await leases.insertOne({
+      _id: phoneNumber,
+      owner: instanceId,
+      epoch,
+      expiresAt,
+    });
+    return lease;
+  } catch (err) {
+    // Already exists and not expired
+    return null;
+  }
+}
+
+export async function forceAcquireLease(phoneNumber: string): Promise<Lease> {
+  const db = getDb();
+  const leases = db.collection<LeaseDoc>("leases");
+  const epoch = await getNextEpoch(phoneNumber);
+  const lease: Lease = { owner: instanceId, epoch };
+  const expiresAt = new Date(Date.now() + leaseTtl());
+
+  await leases.updateOne(
+    { _id: phoneNumber },
+    {
+      $set: {
+        owner: instanceId,
+        epoch,
+        expiresAt,
+      },
+    },
+    { upsert: true },
+  );
   return lease;
 }
 
 export async function renewLease(phoneNumber: string): Promise<RenewResult> {
-  const result = await redis.eval(RENEW_SCRIPT, {
-    keys: [clusterKeys.lease(phoneNumber)],
-    arguments: [instanceId, String(leaseTtl())],
-  });
-  if (result === 1) {
+  const db = getDb();
+  const leases = db.collection<LeaseDoc>("leases");
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + leaseTtl());
+
+  const res = await leases.findOneAndUpdate(
+    {
+      _id: phoneNumber,
+      owner: instanceId,
+    },
+    {
+      $set: { expiresAt },
+    },
+  );
+
+  if (res) {
     return "renewed";
   }
-  if (result === -1) {
+
+  const existing = await leases.findOne({ _id: phoneNumber });
+  if (!existing) {
     return "missing";
   }
   return "lost";
@@ -103,49 +143,84 @@ export async function releaseLease(
   phoneNumber: string,
   expectedEpoch: number,
 ): Promise<boolean> {
-  const result = await redis.eval(RELEASE_SCRIPT, {
-    keys: [clusterKeys.lease(phoneNumber)],
-    arguments: [instanceId, String(expectedEpoch)],
+  const db = getDb();
+  const leases = db.collection<LeaseDoc>("leases");
+  const result = await leases.deleteOne({
+    _id: phoneNumber,
+    owner: instanceId,
+    epoch: expectedEpoch,
   });
-  return result === 1;
+  return result.deletedCount === 1;
 }
 
 export async function getLease(phoneNumber: string): Promise<Lease | null> {
-  const raw = await redis.get(clusterKeys.lease(phoneNumber));
-  return raw ? (JSON.parse(raw) as Lease) : null;
+  const db = getDb();
+  const leases = db.collection<LeaseDoc>("leases");
+  const raw = await leases.findOne({ _id: phoneNumber });
+  if (!raw) {
+    return null;
+  }
+  return {
+    owner: raw.owner,
+    epoch: raw.epoch,
+  };
 }
 
 export async function setReleaseCooldown(phoneNumber: string): Promise<void> {
-  await redis.set(clusterKeys.cooldown(phoneNumber), instanceId, {
-    expiration: { type: "PX", value: config.cluster.releaseCooldownMs },
-  });
+  const db = getDb();
+  const cooldowns = db.collection<CooldownDoc>("cooldowns");
+  const expiresAt = new Date(Date.now() + config.cluster.releaseCooldownMs);
+  await cooldowns.updateOne(
+    { _id: phoneNumber },
+    {
+      $set: {
+        owner: instanceId,
+        expiresAt,
+      },
+    },
+    { upsert: true },
+  );
 }
 
-// Only the instance that released a phone is throttled from re-claiming it —
-// everyone else may claim immediately. This is the anti-ping-pong guard for
-// rebalance releases, not a global lock.
 export async function isOnOwnReleaseCooldown(
   phoneNumber: string,
 ): Promise<boolean> {
-  const value = await redis.get(clusterKeys.cooldown(phoneNumber));
-  return value === instanceId;
+  const db = getDb();
+  const cooldowns = db.collection<CooldownDoc>("cooldowns");
+  const value = await cooldowns.findOne({
+    _id: phoneNumber,
+    expiresAt: { $gt: new Date() },
+  });
+  return value ? value.owner === instanceId : false;
 }
 
-// Directed handoff tombstone: a rebalance release names its intended next
-// owner so the releaser's own claim loop (the lowest-latency claimant) does
-// not just take the phone right back. When the tombstone expires the phone
-// falls back to an open claim — nobody is left waiting on a dead target.
 export async function setHandoffTarget(
   phoneNumber: string,
   targetInstanceId: string,
 ): Promise<void> {
-  await redis.set(clusterKeys.handoff(phoneNumber), targetInstanceId, {
-    expiration: { type: "PX", value: config.cluster.leaseTtlMs },
-  });
+  const db = getDb();
+  const handoffs = db.collection<HandoffDoc>("handoffs");
+  const expiresAt = new Date(Date.now() + config.cluster.leaseTtlMs);
+  await handoffs.updateOne(
+    { _id: phoneNumber },
+    {
+      $set: {
+        target: targetInstanceId,
+        expiresAt,
+      },
+    },
+    { upsert: true },
+  );
 }
 
 export async function getHandoffTarget(
   phoneNumber: string,
 ): Promise<string | null> {
-  return await redis.get(clusterKeys.handoff(phoneNumber));
+  const db = getDb();
+  const handoffs = db.collection<HandoffDoc>("handoffs");
+  const value = await handoffs.findOne({
+    _id: phoneNumber,
+    expiresAt: { $gt: new Date() },
+  });
+  return value ? value.target : null;
 }

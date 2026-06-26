@@ -52,7 +52,8 @@ const app = new Elysia()
 if (!process.env.VERCEL) {
   try {
     const swaggerModule = "@elysiajs/swagger";
-    const swagger = require(swaggerModule).default || require(swaggerModule).swagger;
+    const swagger =
+      require(swaggerModule).default || require(swaggerModule).swagger;
     if (swagger) {
       app.use(
         swagger({

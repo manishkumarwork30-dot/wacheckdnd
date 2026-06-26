@@ -8,8 +8,7 @@ const {
   BAILEYS_LOG_LEVEL,
   BAILEYS_CLIENT_VERSION,
   BAILEYS_OVERRIDE_CLIENT_VERSION,
-  REDIS_URL,
-  REDIS_PASSWORD,
+  MONGO_URL,
   WEBHOOK_RETRY_POLICY_MAX_RETRIES,
   WEBHOOK_RETRY_POLICY_RETRY_INTERVAL,
   WEBHOOK_RETRY_POLICY_BACKOFF_FACTOR,
@@ -118,9 +117,8 @@ const config = {
         : [],
     ),
   },
-  redis: {
-    url: REDIS_URL || "redis://localhost:6379",
-    password: REDIS_PASSWORD || "",
+  mongo: {
+    url: MONGO_URL || "mongodb://localhost:27017",
   },
   webhook: {
     retryPolicy: {

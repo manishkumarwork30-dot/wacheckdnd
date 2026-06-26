@@ -79,8 +79,7 @@ var {
   BAILEYS_LOG_LEVEL,
   BAILEYS_CLIENT_VERSION,
   BAILEYS_OVERRIDE_CLIENT_VERSION,
-  REDIS_URL,
-  REDIS_PASSWORD,
+  MONGO_URL,
   WEBHOOK_RETRY_POLICY_MAX_RETRIES,
   WEBHOOK_RETRY_POLICY_RETRY_INTERVAL,
   WEBHOOK_RETRY_POLICY_BACKOFF_FACTOR,
@@ -161,9 +160,8 @@ var config = {
       BAILEYS_LISTEN_TO_EVENTS ? BAILEYS_LISTEN_TO_EVENTS.split(",").map((e) => e.trim()) : []
     )
   },
-  redis: {
-    url: REDIS_URL || "redis://localhost:6379",
-    password: REDIS_PASSWORD || ""
+  mongo: {
+    url: MONGO_URL || "mongodb://localhost:27017"
   },
   webhook: {
     retryPolicy: {
@@ -491,22 +489,6 @@ var incarnationId = Math.random().toString(36).slice(2, 10);
 var role = config_default.cluster.role;
 var workerBaseUrl = config_default.cluster.workerBaseUrl || `http://${os.hostname()}:${config_default.port}`;
 
-// src/cluster/keys.ts
-var prefix = "@baileys-api:cluster";
-var clusterKeys = {
-  lease: (phoneNumber) => `${prefix}:lease:${phoneNumber}`,
-  // Monotonic per-phone counter, bumped on every successful acquire. Owner
-  // epochs strictly increase across successive owners, so a stale owner can
-  // always be detected by comparing epochs.
-  leaseEpoch: (phoneNumber) => `${prefix}:lease-epoch:${phoneNumber}`,
-  instance: (instanceId2) => `${prefix}:instance:${instanceId2}`,
-  instancePattern: `${prefix}:instance:*`,
-  handoff: (phoneNumber) => `${prefix}:handoff:${phoneNumber}`,
-  cooldown: (phoneNumber) => `${prefix}:cooldown:${phoneNumber}`,
-  eventsChannel: `${prefix}:events`
-};
-var mediaOwnerKey = (messageId2) => `@baileys-api:media-owner:${messageId2}`;
-
 // src/helpers/errorToString.ts
 function errorToString(error) {
   if (error instanceof Error) {
@@ -521,17 +503,15 @@ function errorToString(error) {
   return "";
 }
 
-// src/lib/redis.ts
-import { createClient } from "redis";
-var redis = createClient(config_default.redis);
-redis.on("error", (error) => {
-  logger_default.error("Redis client error\n%s", errorToString(error));
-});
-redis.on("connect", async () => {
-  await redis.clientSetName("baileys-api");
-  logger_default.info("Connected to Redis");
-});
-var redis_default = redis;
+// src/lib/mongodb.ts
+import { MongoClient } from "mongodb";
+var db = null;
+function getDb() {
+  if (!db) {
+    throw new Error("Database not initialized. Call initializeMongo() first.");
+  }
+  return db;
+}
 
 // src/baileys/helpers/downloadMediaFromMessages.ts
 var CONCURRENCY = 3;
@@ -567,15 +547,16 @@ async function downloadMediaFromMessages(messages, options) {
         const filePath = path2.join(mediaDir, `${key.id}`);
         await file(filePath).write(fileBuffer);
         try {
-          await redis_default.set(
-            mediaOwnerKey(key.id),
-            instanceId,
-            config_default.media.cleanupEnabled ? {
-              expiration: {
-                type: "EX",
-                value: config_default.media.maxAgeHours * 3600 + Math.ceil(config_default.media.cleanupIntervalMs / 1e3)
-              }
-            } : void 0
+          const db2 = getDb();
+          const expiresAt = config_default.media.cleanupEnabled ? new Date(
+            Date.now() + (config_default.media.maxAgeHours * 3600 + Math.ceil(config_default.media.cleanupIntervalMs / 1e3)) * 1e3
+          ) : void 0;
+          await db2.collection(
+            "media_owners"
+          ).updateOne(
+            { _id: key.id },
+            { $set: { owner: instanceId, expiresAt } },
+            { upsert: true }
           );
         } catch (error) {
           if (config_default.cluster.role === "worker") {
@@ -747,62 +728,42 @@ import {
   initAuthCreds,
   proto
 } from "@whiskeysockets/baileys";
-
-// src/lib/scanKeys.ts
-async function scanKeys(pattern, count = 250) {
-  const keys = /* @__PURE__ */ new Set();
-  for await (const batch of redis_default.scanIterator({
-    MATCH: pattern,
-    COUNT: count
-  })) {
-    for (const key of batch) {
-      keys.add(key);
-    }
-  }
-  return [...keys];
-}
-
-// src/baileys/redisAuthState.ts
-var redisKeyPrefix = "@baileys-api:connections";
 var DELETE_SENTINEL = "@@DEL@@";
-var WRITE_IF_OWNER_SCRIPT = `
-local raw = redis.call('GET', KEYS[2])
-if raw then
-  local lease = cjson.decode(raw)
-  if lease.owner ~= ARGV[1] then return 0 end
-end
-for i = 2, #ARGV - 1, 2 do
-  if ARGV[i + 1] == '${DELETE_SENTINEL}' then
-    redis.call('HDEL', KEYS[1], ARGV[i])
-  else
-    redis.call('HSET', KEYS[1], ARGV[i], ARGV[i + 1])
-  end
-end
-return 1
-`;
-var CLEAR_IF_OWNER_SCRIPT = `
--- clear-if-owner
-local raw = redis.call('GET', KEYS[2])
-if raw then
-  local lease = cjson.decode(raw)
-  if lease.owner ~= ARGV[1] then return 0 end
-end
-return redis.call('DEL', KEYS[1])
-`;
 async function fencedAuthWrite(id, pairs) {
   if (pairs.length === 0) {
     return true;
   }
-  const result = await redis_default.eval(WRITE_IF_OWNER_SCRIPT, {
-    keys: [`${redisKeyPrefix}:${id}:authState`, clusterKeys.lease(id)],
-    arguments: [instanceId, ...pairs]
-  });
-  if (result !== 1) {
+  const db2 = getDb();
+  const lease = await db2.collection("leases").findOne({ _id: id });
+  if (lease && lease.owner !== instanceId && new Date(lease.expiresAt) > /* @__PURE__ */ new Date()) {
     logger_default.warn(
       "[%s] [fencedAuthWrite] write rejected \u2014 lease is owned by another instance",
       id
     );
     return false;
+  }
+  const ops = [];
+  for (let i = 0; i < pairs.length; i += 2) {
+    const field = pairs[i];
+    const value = pairs[i + 1];
+    if (value === DELETE_SENTINEL) {
+      ops.push({
+        deleteOne: {
+          filter: { connectionId: id, field }
+        }
+      });
+    } else {
+      ops.push({
+        updateOne: {
+          filter: { connectionId: id, field },
+          update: { $set: { value, updatedAt: /* @__PURE__ */ new Date() } },
+          upsert: true
+        }
+      });
+    }
+  }
+  if (ops.length > 0) {
+    await db2.collection("auth_states").bulkWrite(ops);
   }
   return true;
 }
@@ -810,11 +771,11 @@ async function writeAuthMetadata(id, metadata) {
   return fencedAuthWrite(id, ["metadata", JSON.stringify(metadata)]);
 }
 async function useRedisAuthState(id, metadata) {
-  const createKey = (key) => `${redisKeyPrefix}:${id}:${key}`;
+  const db2 = getDb();
   const writeData = (_key, field, data) => fencedAuthWrite(id, [field, JSON.stringify(data, BufferJSON.replacer)]);
   const readData = async (key, field) => {
-    const data = await redis_default.hGet(createKey(key), field);
-    return data ? JSON.parse(data, BufferJSON.reviver) : null;
+    const doc = await db2.collection("auth_states").findOne({ connectionId: id, field });
+    return doc && doc.value ? JSON.parse(doc.value, BufferJSON.reviver) : null;
   };
   const creds = await readData("authState", "creds") || initAuthCreds();
   if (metadata !== void 0) {
@@ -827,9 +788,10 @@ async function useRedisAuthState(id, metadata) {
         get: async (type, ids) => {
           const data = {};
           await Promise.all(
-            ids.map(async (id2) => {
-              const value = await readData("authState", `${type}-${id2}`);
-              data[id2] = type === "app-state-sync-key" && value ? proto.Message.AppStateSyncKeyData.fromObject(value) : value;
+            ids.map(async (signalId) => {
+              const field = `${type}-${signalId}`;
+              const value = await readData("authState", field);
+              data[signalId] = type === "app-state-sync-key" && value ? proto.Message.AppStateSyncKeyData.fromObject(value) : value;
             })
           );
           return data;
@@ -849,16 +811,15 @@ async function useRedisAuthState(id, metadata) {
           await fencedAuthWrite(id, pairs);
         },
         clear: async () => {
-          const result = await redis_default.eval(CLEAR_IF_OWNER_SCRIPT, {
-            keys: [createKey("authState"), clusterKeys.lease(id)],
-            arguments: [instanceId]
-          });
-          if (result === 0) {
+          const lease = await db2.collection("leases").findOne({ _id: id });
+          if (lease && lease.owner !== instanceId && new Date(lease.expiresAt) > /* @__PURE__ */ new Date()) {
             logger_default.warn(
               "[%s] [clearAuthState] clear rejected \u2014 lease is owned by another instance",
               id
             );
+            return;
           }
+          await db2.collection("auth_states").deleteMany({ connectionId: id });
         }
       }
     },
@@ -868,120 +829,193 @@ async function useRedisAuthState(id, metadata) {
   };
 }
 async function isRedisAuthStatePaired(id) {
-  const data = await redis_default.hGet(`${redisKeyPrefix}:${id}:authState`, "creds");
-  if (!data) {
+  const db2 = getDb();
+  const doc = await db2.collection("auth_states").findOne({ connectionId: id, field: "creds" });
+  if (!doc || !doc.value) {
     return false;
   }
   try {
-    const creds = JSON.parse(data);
+    const creds = JSON.parse(doc.value);
     return Boolean(creds?.me?.id);
   } catch {
     return false;
   }
 }
 async function getRedisAuthMetadata(id) {
-  const data = await redis_default.hGet(
-    `${redisKeyPrefix}:${id}:authState`,
-    "metadata"
-  );
-  return data ? JSON.parse(data) : null;
+  const db2 = getDb();
+  const doc = await db2.collection("auth_states").findOne({ connectionId: id, field: "metadata" });
+  return doc && doc.value ? JSON.parse(doc.value) : null;
 }
 async function getRedisSavedAuthStateIds() {
-  const keys = await scanKeys(`${redisKeyPrefix}:*:authState`);
-  const ids = keys.map((key) => key.split(":").at(-2) ?? "").filter(Boolean);
-  const multi = redis_default.multi();
-  for (const id of ids) {
-    multi.hGet(`${redisKeyPrefix}:${id}:authState`, "metadata");
-  }
-  const metadata = await multi.execAsPipeline();
-  return ids.map((id, i) => ({
-    id,
-    metadata: metadata[i] ? JSON.parse(metadata[i].toString()) : null
-  })).filter((item) => item.metadata);
+  const db2 = getDb();
+  const docs = await db2.collection("auth_states").find({ field: "metadata" }).toArray();
+  return docs.map((doc) => ({
+    id: doc.connectionId,
+    metadata: doc.value ? JSON.parse(doc.value) : null
+  })).filter((item) => item.metadata !== null);
 }
 
 // src/cluster/leaseStore.ts
-var RENEW_SCRIPT = `
-local raw = redis.call('GET', KEYS[1])
-if not raw then return -1 end
-local lease = cjson.decode(raw)
-if lease.owner ~= ARGV[1] then return 0 end
-redis.call('PEXPIRE', KEYS[1], ARGV[2])
-return 1
-`;
-var RELEASE_SCRIPT = `
-local raw = redis.call('GET', KEYS[1])
-if not raw then return 0 end
-local lease = cjson.decode(raw)
-if lease.owner ~= ARGV[1] then return 0 end
-if tostring(lease.epoch) ~= ARGV[2] then return 0 end
-redis.call('DEL', KEYS[1])
-return 1
-`;
 function leaseTtl() {
   return config_default.cluster.leaseTtlMs;
 }
-async function acquireLease(phoneNumber) {
-  const epoch = await redis_default.incr(clusterKeys.leaseEpoch(phoneNumber));
-  const lease = { owner: instanceId, epoch };
-  const result = await redis_default.set(
-    clusterKeys.lease(phoneNumber),
-    JSON.stringify(lease),
-    {
-      condition: "NX",
-      expiration: { type: "PX", value: leaseTtl() }
-    }
+async function getNextEpoch(phoneNumber) {
+  const db2 = getDb();
+  const epochs = db2.collection("lease_epochs");
+  const res = await epochs.findOneAndUpdate(
+    { _id: phoneNumber },
+    { $inc: { epoch: 1 } },
+    { upsert: true, returnDocument: "after" }
   );
-  return result ? lease : null;
+  return res && res.epoch ? res.epoch : 1;
+}
+async function acquireLease(phoneNumber) {
+  const db2 = getDb();
+  const leases = db2.collection("leases");
+  const epoch = await getNextEpoch(phoneNumber);
+  const lease = { owner: instanceId, epoch };
+  const now = /* @__PURE__ */ new Date();
+  const expiresAt = new Date(now.getTime() + leaseTtl());
+  const updateRes = await leases.findOneAndUpdate(
+    {
+      _id: phoneNumber,
+      expiresAt: { $lt: now }
+    },
+    {
+      $set: {
+        owner: instanceId,
+        epoch,
+        expiresAt
+      }
+    },
+    { returnDocument: "after" }
+  );
+  if (updateRes) {
+    return lease;
+  }
+  try {
+    await leases.insertOne({
+      _id: phoneNumber,
+      owner: instanceId,
+      epoch,
+      expiresAt
+    });
+    return lease;
+  } catch (err) {
+    return null;
+  }
 }
 async function forceAcquireLease(phoneNumber) {
-  const epoch = await redis_default.incr(clusterKeys.leaseEpoch(phoneNumber));
+  const db2 = getDb();
+  const leases = db2.collection("leases");
+  const epoch = await getNextEpoch(phoneNumber);
   const lease = { owner: instanceId, epoch };
-  await redis_default.set(clusterKeys.lease(phoneNumber), JSON.stringify(lease), {
-    expiration: { type: "PX", value: leaseTtl() }
-  });
+  const expiresAt = new Date(Date.now() + leaseTtl());
+  await leases.updateOne(
+    { _id: phoneNumber },
+    {
+      $set: {
+        owner: instanceId,
+        epoch,
+        expiresAt
+      }
+    },
+    { upsert: true }
+  );
   return lease;
 }
 async function renewLease(phoneNumber) {
-  const result = await redis_default.eval(RENEW_SCRIPT, {
-    keys: [clusterKeys.lease(phoneNumber)],
-    arguments: [instanceId, String(leaseTtl())]
-  });
-  if (result === 1) {
+  const db2 = getDb();
+  const leases = db2.collection("leases");
+  const now = /* @__PURE__ */ new Date();
+  const expiresAt = new Date(now.getTime() + leaseTtl());
+  const res = await leases.findOneAndUpdate(
+    {
+      _id: phoneNumber,
+      owner: instanceId
+    },
+    {
+      $set: { expiresAt }
+    }
+  );
+  if (res) {
     return "renewed";
   }
-  if (result === -1) {
+  const existing = await leases.findOne({ _id: phoneNumber });
+  if (!existing) {
     return "missing";
   }
   return "lost";
 }
 async function releaseLease(phoneNumber, expectedEpoch) {
-  const result = await redis_default.eval(RELEASE_SCRIPT, {
-    keys: [clusterKeys.lease(phoneNumber)],
-    arguments: [instanceId, String(expectedEpoch)]
+  const db2 = getDb();
+  const leases = db2.collection("leases");
+  const result = await leases.deleteOne({
+    _id: phoneNumber,
+    owner: instanceId,
+    epoch: expectedEpoch
   });
-  return result === 1;
+  return result.deletedCount === 1;
 }
 async function getLease(phoneNumber) {
-  const raw = await redis_default.get(clusterKeys.lease(phoneNumber));
-  return raw ? JSON.parse(raw) : null;
+  const db2 = getDb();
+  const leases = db2.collection("leases");
+  const raw = await leases.findOne({ _id: phoneNumber });
+  if (!raw) {
+    return null;
+  }
+  return {
+    owner: raw.owner,
+    epoch: raw.epoch
+  };
 }
 async function setReleaseCooldown(phoneNumber) {
-  await redis_default.set(clusterKeys.cooldown(phoneNumber), instanceId, {
-    expiration: { type: "PX", value: config_default.cluster.releaseCooldownMs }
-  });
+  const db2 = getDb();
+  const cooldowns = db2.collection("cooldowns");
+  const expiresAt = new Date(Date.now() + config_default.cluster.releaseCooldownMs);
+  await cooldowns.updateOne(
+    { _id: phoneNumber },
+    {
+      $set: {
+        owner: instanceId,
+        expiresAt
+      }
+    },
+    { upsert: true }
+  );
 }
 async function isOnOwnReleaseCooldown(phoneNumber) {
-  const value = await redis_default.get(clusterKeys.cooldown(phoneNumber));
-  return value === instanceId;
+  const db2 = getDb();
+  const cooldowns = db2.collection("cooldowns");
+  const value = await cooldowns.findOne({
+    _id: phoneNumber,
+    expiresAt: { $gt: /* @__PURE__ */ new Date() }
+  });
+  return value ? value.owner === instanceId : false;
 }
 async function setHandoffTarget(phoneNumber, targetInstanceId) {
-  await redis_default.set(clusterKeys.handoff(phoneNumber), targetInstanceId, {
-    expiration: { type: "PX", value: config_default.cluster.leaseTtlMs }
-  });
+  const db2 = getDb();
+  const handoffs = db2.collection("handoffs");
+  const expiresAt = new Date(Date.now() + config_default.cluster.leaseTtlMs);
+  await handoffs.updateOne(
+    { _id: phoneNumber },
+    {
+      $set: {
+        target: targetInstanceId,
+        expiresAt
+      }
+    },
+    { upsert: true }
+  );
 }
 async function getHandoffTarget(phoneNumber) {
-  return await redis_default.get(clusterKeys.handoff(phoneNumber));
+  const db2 = getDb();
+  const handoffs = db2.collection("handoffs");
+  const value = await handoffs.findOne({
+    _id: phoneNumber,
+    expiresAt: { $gt: /* @__PURE__ */ new Date() }
+  });
+  return value ? value.target : null;
 }
 
 // src/helpers/asyncSleep.ts
@@ -1105,10 +1139,10 @@ var BaileysConnection = class {
     this._lastTrafficAt = performance.now();
   }
   // biome-ignore lint/suspicious/noExplicitAny: Typing this wrapper is not trivial.
-  withErrorHandling(handlerName, handler) {
+  withErrorHandling(handlerName, handler2) {
     return async (...args) => {
       try {
-        await handler.apply(this, args);
+        await handler2.apply(this, args);
       } catch (error) {
         logger_default.error(
           "[%s] [%s] Error: %s",
@@ -1264,10 +1298,10 @@ var BaileysConnection = class {
         this.handlePresenceUpdate
       )
     };
-    Object.entries(handledEvents).forEach(([event, handler]) => {
+    Object.entries(handledEvents).forEach(([event, handler2]) => {
       this.socket?.ev.on(
         event,
-        handler
+        handler2
       );
     });
     this.ALL_BAILEYS_SOCKET_EVENTS.forEach((event) => {
@@ -2353,7 +2387,6 @@ var baileys_default = baileys;
 // src/middlewares/auth.ts
 import { createHash } from "node:crypto";
 import { LRUCache } from "lru-cache";
-var REDIS_KEY_PREFIX = "@baileys-api:api-keys";
 var apiKeyCache = new LRUCache({
   max: 1e3,
   ttl: 5 * 60 * 1e3
@@ -2372,13 +2405,13 @@ var authMiddleware = (app2) => app2.derive(async ({ request }) => {
     if (cached) {
       return { auth: cached, apiKeyHash };
     }
-    const key = `${REDIS_KEY_PREFIX}:${apiKey}`;
-    const raw = await redis_default.get(key);
-    if (!raw) {
+    const db2 = getDb();
+    const doc = await db2.collection("api_keys").findOne({ key: apiKey });
+    if (!doc) {
       logger_default.warn("Invalid API key attempted: %s", apiKeyHash);
       return { auth: null, apiKeyHash: null };
     }
-    const auth = JSON.parse(raw);
+    const auth = { role: doc.role };
     apiKeyCache.set(apiKey, auth);
     return { auth, apiKeyHash };
   } catch (error) {
@@ -2428,60 +2461,51 @@ import Elysia2 from "elysia";
 // src/cluster/instanceRegistry.ts
 var startedAt = Date.now();
 async function heartbeat(info) {
-  const key = clusterKeys.instance(instanceId);
+  const db2 = getDb();
+  const instances = db2.collection("instances");
   const payload = {
     instanceId,
-    baseUrl: workerBaseUrl,
+    baseUrl: workerBaseUrl ?? "",
     connectionCount: info.connectionCount,
     draining: info.draining,
-    startedAt
+    startedAt,
+    updatedAt: /* @__PURE__ */ new Date()
   };
-  await redis_default.set(key, JSON.stringify(payload), {
-    expiration: { type: "PX", value: config_default.cluster.instanceTtlMs }
-  });
+  await instances.updateOne(
+    { _id: instanceId },
+    { $set: payload },
+    { upsert: true }
+  );
 }
 async function listLiveInstances() {
-  const keys = await scanKeys(clusterKeys.instancePattern);
-  if (keys.length === 0) {
-    return [];
-  }
-  const values = await Promise.all(keys.map((key) => redis_default.get(key)));
-  const instances = [];
-  for (const value of values) {
-    if (!value) {
-      continue;
-    }
-    try {
-      instances.push(JSON.parse(value));
-    } catch (error) {
-      logger_default.warn(
-        "[registry] skipping malformed instance entry %s: %s",
-        value,
-        errorToString(error)
-      );
-    }
-  }
-  return instances;
+  const db2 = getDb();
+  const instances = db2.collection("instances");
+  const cutoff = new Date(Date.now() - config_default.cluster.instanceTtlMs);
+  const docs = await instances.find({ updatedAt: { $gt: cutoff } }).toArray();
+  return docs.map((doc) => ({
+    instanceId: doc.instanceId,
+    baseUrl: doc.baseUrl,
+    connectionCount: doc.connectionCount,
+    draining: doc.draining,
+    startedAt: doc.startedAt
+  }));
 }
 async function isInstanceAlive(id) {
-  return await redis_default.exists(clusterKeys.instance(id)) === 1;
+  const db2 = getDb();
+  const instances = db2.collection("instances");
+  const cutoff = new Date(Date.now() - config_default.cluster.instanceTtlMs);
+  const count = await instances.countDocuments({
+    _id: id,
+    updatedAt: { $gt: cutoff }
+  });
+  return count === 1;
 }
 async function deregister() {
-  await redis_default.del(clusterKeys.instance(instanceId));
+  const db2 = getDb();
+  const instances = db2.collection("instances");
+  await instances.deleteOne({ _id: instanceId });
 }
 async function publishOwnershipChanged(phoneNumber) {
-  const event = {
-    type: "ownership.changed",
-    phoneNumber,
-    instanceId
-  };
-  await redis_default.publish(clusterKeys.eventsChannel, JSON.stringify(event)).catch((error) => {
-    logger_default.warn(
-      "[registry] ownership.changed publish failed for %s: %s",
-      phoneNumber,
-      errorToString(error)
-    );
-  });
 }
 
 // src/cluster/coordinator.ts
@@ -2493,7 +2517,7 @@ var BaileysConnectionOwnedElsewhereError = class extends Error {
   }
 };
 var ClusterCoordinator = class {
-  constructor(handler, options) {
+  constructor(handler2, options) {
     this.running = false;
     this.draining = false;
     // Set when Redis is unreachable; pauses claims (our view of the cluster is
@@ -2519,7 +2543,7 @@ var ClusterCoordinator = class {
     // compare-and-delete on (owner, epoch), so a stale release can never drop a
     // lease the same instance has since re-acquired under a newer epoch.
     this.heldLeaseEpochs = /* @__PURE__ */ new Map();
-    this.handler = handler;
+    this.handler = handler2;
     this.options = {
       claimIntervalMs: config_default.cluster.claimIntervalMs,
       claimJitterMs: config_default.cluster.claimJitterMs,
@@ -2891,7 +2915,7 @@ var ClusterCoordinator = class {
     if (phones.length === 0) {
       if (this.redisDegraded) {
         try {
-          await redis_default.ping();
+          await getDb().command({ ping: 1 });
           this.redisDegraded = false;
         } catch {
         }
@@ -3177,12 +3201,6 @@ function buildEditableMessageContent(content) {
 var IDEMPOTENCY_TTL = 600;
 var PROCESSING_PREFIX = "processing:";
 var processingValue = () => `${PROCESSING_PREFIX}${instanceId}#${incarnationId}`;
-var STEAL_SCRIPT = `-- steal-if-stale idempotency lock
-if redis.call("GET", KEYS[1]) == ARGV[1] then
-  redis.call("SET", KEYS[1], ARGV[2], "EX", ARGV[3])
-  return 1
-end
-return 0`;
 async function withIdempotency(key, fn) {
   if (!key) {
     const value = await fn();
@@ -3214,9 +3232,12 @@ async function acquireOrSteal(key) {
   if (await acquireLock(key)) {
     return { status: "owned" };
   }
-  let current;
+  let current = null;
   try {
-    current = await redis_default.get(key);
+    const db2 = getDb();
+    const collection = db2.collection("idempotency");
+    const doc = await collection.findOne({ _id: key });
+    current = doc ? doc.value : null;
   } catch (error) {
     logger_default.warn(
       "[withIdempotency] holder inspection failed, treating as processing: %s",
@@ -3282,12 +3303,19 @@ function parseHolder(value) {
 }
 async function acquireLock(key) {
   try {
-    const result = await redis_default.set(key, processingValue(), {
-      NX: true,
-      EX: IDEMPOTENCY_TTL
+    const db2 = getDb();
+    const collection = db2.collection("idempotency");
+    const expiresAt = new Date(Date.now() + IDEMPOTENCY_TTL * 1e3);
+    await collection.insertOne({
+      _id: key,
+      value: processingValue(),
+      expiresAt
     });
-    return result === "OK";
+    return true;
   } catch (error) {
+    if (error.code === 11e3) {
+      return false;
+    }
     logger_default.warn(
       "[withIdempotency] lock acquire failed, proceeding without cache: %s",
       errorToString(error)
@@ -3297,11 +3325,19 @@ async function acquireLock(key) {
 }
 async function stealLock(key, expected) {
   try {
-    const result = await redis_default.eval(STEAL_SCRIPT, {
-      keys: [key],
-      arguments: [expected, processingValue(), String(IDEMPOTENCY_TTL)]
-    });
-    return result === 1;
+    const db2 = getDb();
+    const collection = db2.collection("idempotency");
+    const expiresAt = new Date(Date.now() + IDEMPOTENCY_TTL * 1e3);
+    const result = await collection.updateOne(
+      { _id: key, value: expected },
+      {
+        $set: {
+          value: processingValue(),
+          expiresAt
+        }
+      }
+    );
+    return result.modifiedCount === 1;
   } catch (error) {
     logger_default.warn(
       "[withIdempotency] lock steal failed: %s",
@@ -3312,13 +3348,27 @@ async function stealLock(key, expected) {
 }
 async function releaseLock(key) {
   try {
-    await redis_default.del(key);
+    const db2 = getDb();
+    const collection = db2.collection("idempotency");
+    await collection.deleteOne({ _id: key });
   } catch {
   }
 }
 async function cacheResult(key, value) {
   try {
-    await redis_default.set(key, JSON.stringify(value), { EX: IDEMPOTENCY_TTL });
+    const db2 = getDb();
+    const collection = db2.collection("idempotency");
+    const expiresAt = new Date(Date.now() + IDEMPOTENCY_TTL * 1e3);
+    await collection.updateOne(
+      { _id: key },
+      {
+        $set: {
+          value: JSON.stringify(value),
+          expiresAt
+        }
+      },
+      { upsert: true }
+    );
     return true;
   } catch (error) {
     logger_default.warn(
@@ -5319,11 +5369,9 @@ if (config_default.env === "development") {
 var app_default = app;
 
 // src/vercel-entry.ts
-var vercel_entry_default = {
-  async fetch(request) {
-    return app_default.handle(request);
-  }
-};
+async function handler(request) {
+  return app_default.handle(request);
+}
 export {
-  vercel_entry_default as default
+  handler as default
 };

@@ -1,10 +1,6 @@
 import { instanceId, workerBaseUrl } from "@/cluster/identity";
-import { clusterKeys } from "@/cluster/keys";
 import config from "@/config";
-import { errorToString } from "@/helpers/errorToString";
-import logger from "@/lib/logger";
-import redis from "@/lib/redis";
-import { scanKeys } from "@/lib/scanKeys";
+import { getDb } from "@/lib/mongodb";
 
 export interface InstanceInfo {
   instanceId: string;
@@ -14,79 +10,86 @@ export interface InstanceInfo {
   startedAt: number;
 }
 
+interface InstanceRegistryDoc {
+  _id: string;
+  instanceId: string;
+  baseUrl: string;
+  connectionCount: number;
+  draining: boolean;
+  startedAt: number;
+  updatedAt: Date;
+}
+
 const startedAt = Date.now();
 
-// Liveness in the registry is the heartbeat TTL itself: an instance that
-// stops heartbeating (crash, SIGKILL, partition) disappears after
-// instanceTtlMs and is treated as dead by everyone else.
 export async function heartbeat(info: {
   connectionCount: number;
   draining: boolean;
 }): Promise<void> {
-  const key = clusterKeys.instance(instanceId);
-  const payload: InstanceInfo = {
+  const db = getDb();
+  const instances = db.collection<InstanceRegistryDoc>("instances");
+  const payload = {
     instanceId,
-    baseUrl: workerBaseUrl,
+    baseUrl: workerBaseUrl ?? "",
     connectionCount: info.connectionCount,
     draining: info.draining,
     startedAt,
+    updatedAt: new Date(),
   };
-  await redis.set(key, JSON.stringify(payload), {
-    expiration: { type: "PX", value: config.cluster.instanceTtlMs },
-  });
+
+  await instances.updateOne(
+    { _id: instanceId },
+    { $set: payload },
+    { upsert: true },
+  );
 }
 
 export async function listLiveInstances(): Promise<InstanceInfo[]> {
-  const keys = await scanKeys(clusterKeys.instancePattern);
-  if (keys.length === 0) {
-    return [];
-  }
-  const values = await Promise.all(keys.map((key) => redis.get(key)));
-  const instances: InstanceInfo[] = [];
-  for (const value of values) {
-    if (!value) {
-      continue;
-    }
-    // One malformed entry must not collapse the whole liveness view — that
-    // would distort fair share and trigger avoidable claim churn.
-    try {
-      instances.push(JSON.parse(value) as InstanceInfo);
-    } catch (error) {
-      logger.warn(
-        "[registry] skipping malformed instance entry %s: %s",
-        value,
-        errorToString(error),
-      );
-    }
-  }
-  return instances;
+  const db = getDb();
+  const instances = db.collection<InstanceRegistryDoc>("instances");
+  const cutoff = new Date(Date.now() - config.cluster.instanceTtlMs);
+  const docs = await instances.find({ updatedAt: { $gt: cutoff } }).toArray();
+
+  return docs.map((doc) => ({
+    instanceId: doc.instanceId,
+    baseUrl: doc.baseUrl,
+    connectionCount: doc.connectionCount,
+    draining: doc.draining,
+    startedAt: doc.startedAt,
+  }));
 }
 
 export async function isInstanceAlive(id: string): Promise<boolean> {
-  return (await redis.exists(clusterKeys.instance(id))) === 1;
+  const db = getDb();
+  const instances = db.collection<InstanceRegistryDoc>("instances");
+  const cutoff = new Date(Date.now() - config.cluster.instanceTtlMs);
+  const count = await instances.countDocuments({
+    _id: id,
+    updatedAt: { $gt: cutoff },
+  });
+  return count === 1;
 }
 
 export async function getInstance(id: string): Promise<InstanceInfo | null> {
-  const value = await redis.get(clusterKeys.instance(id));
-  if (!value) {
+  const db = getDb();
+  const instances = db.collection<InstanceRegistryDoc>("instances");
+  const doc = await instances.findOne({ _id: id });
+  if (!doc) {
     return null;
   }
-  // Same containment as listLiveInstances: a malformed entry is "missing",
-  // not an exception bubbling into the proxy's request path.
-  try {
-    return JSON.parse(value) as InstanceInfo;
-  } catch (error) {
-    logger.warn(
-      "[registry] malformed instance entry for %s: %s",
-      id,
-      errorToString(error),
-    );
-    return null;
-  }
+  return {
+    instanceId: doc.instanceId,
+    baseUrl: doc.baseUrl,
+    connectionCount: doc.connectionCount,
+    draining: doc.draining,
+    startedAt: doc.startedAt,
+  };
 }
 
 export async function deregister(): Promise<void> {
-  await redis.del(clusterKeys.instance(instanceId));
+  const db = getDb();
+  const instances = db.collection<InstanceRegistryDoc>("instances");
+  await instances.deleteOne({ _id: instanceId });
 }
 
 export interface OwnershipChangedEvent {
@@ -95,24 +98,8 @@ export interface OwnershipChangedEvent {
   instanceId: string;
 }
 
-// Best-effort hint for proxies to drop their cached route for this phone.
-// Correctness does not depend on it — the route cache TTL and the workers'
-// 421 responses are the backstops — so failures are swallowed.
 export async function publishOwnershipChanged(
   phoneNumber: string,
 ): Promise<void> {
-  const event: OwnershipChangedEvent = {
-    type: "ownership.changed",
-    phoneNumber,
-    instanceId,
-  };
-  await redis
-    .publish(clusterKeys.eventsChannel, JSON.stringify(event))
-    .catch((error) => {
-      logger.warn(
-        "[registry] ownership.changed publish failed for %s: %s",
-        phoneNumber,
-        errorToString(error),
-      );
-    });
+  // No-op. Change streams on leases collection handles invalidation.
 }

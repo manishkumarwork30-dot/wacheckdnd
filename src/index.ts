@@ -3,7 +3,7 @@ import coordinator from "@/cluster";
 import config from "@/config";
 import { errorToString } from "@/helpers/errorToString";
 import logger, { deepSanitizeObject } from "@/lib/logger";
-import { initializeRedis } from "@/lib/redis";
+import { initializeMongo } from "@/lib/mongodb";
 import proxyApp from "@/proxy/app";
 import {
   startRouteCacheInvalidation,
@@ -39,7 +39,9 @@ const mediaCleanup = new MediaCleanupService({
 const bootstrap = async () => {
   // If running in serverless deployment on Vercel, bypass full standalone TCP server listen loop
   if (process.env.VERCEL) {
-    console.log("Running in Vercel serverless context. Exiting startup listeners.");
+    console.log(
+      "Running in Vercel serverless context. Exiting startup listeners.",
+    );
     return;
   }
 
@@ -47,7 +49,7 @@ const bootstrap = async () => {
   // requests without coordination guarantees would hold sockets it can never
   // lease, and the proxy cannot resolve routes at all. Fail fast instead.
   try {
-    await initializeRedis();
+    await initializeMongo();
     if (isProxy) {
       // The proxy holds no sockets and no media; it only needs Redis (route
       // resolution) and the pub/sub invalidation feed. A failed subscription
@@ -86,7 +88,6 @@ const bootstrap = async () => {
 };
 
 void bootstrap();
-
 
 let shuttingDown = false;
 const shutdown = async (signal: string) => {
@@ -131,4 +132,3 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
 export default server;
-

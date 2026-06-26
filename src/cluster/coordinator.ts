@@ -11,7 +11,7 @@ import config from "@/config";
 import { asyncSleep } from "@/helpers/asyncSleep";
 import { errorToString } from "@/helpers/errorToString";
 import logger from "@/lib/logger";
-import redis from "@/lib/redis";
+import { getDb } from "@/lib/mongodb";
 
 type StoredMetadata = Omit<
   BaileysConnectionOptions,
@@ -581,7 +581,7 @@ export class ClusterCoordinator {
       // directly instead.
       if (this.redisDegraded) {
         try {
-          await redis.ping();
+          await getDb().command({ ping: 1 });
           this.redisDegraded = false;
         } catch {
           // Still unreachable; claims stay paused.

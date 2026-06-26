@@ -13,7 +13,7 @@ import { mediaOwnerKey } from "@/cluster/keys";
 import config from "@/config";
 import { errorToString } from "@/helpers/errorToString";
 import logger from "@/lib/logger";
-import redis from "@/lib/redis";
+import { getDb } from "@/lib/mongodb";
 
 type MediaMessage =
   | proto.Message.IImageMessage
@@ -76,20 +76,24 @@ export async function downloadMediaFromMessages(
         // cleanup disabled the file is retained indefinitely, so the routing
         // key must persist too.
         try {
-          await redis.set(
-            mediaOwnerKey(key.id),
-            instanceId,
-            config.media.cleanupEnabled
-              ? {
-                  expiration: {
-                    type: "EX",
-                    value:
-                      config.media.maxAgeHours * 3600 +
-                      Math.ceil(config.media.cleanupIntervalMs / 1000),
-                  },
-                }
-              : undefined,
-          );
+          const db = getDb();
+          const expiresAt = config.media.cleanupEnabled
+            ? new Date(
+                Date.now() +
+                  (config.media.maxAgeHours * 3600 +
+                    Math.ceil(config.media.cleanupIntervalMs / 1000)) *
+                    1000,
+              )
+            : undefined;
+          await db
+            .collection<{ _id: string; owner: string; expiresAt?: Date }>(
+              "media_owners",
+            )
+            .updateOne(
+              { _id: key.id },
+              { $set: { owner: instanceId, expiresAt } },
+              { upsert: true },
+            );
         } catch (error) {
           if (config.cluster.role === "worker") {
             // Behind a proxy the owner key is the only route to this file —

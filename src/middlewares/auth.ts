@@ -4,7 +4,7 @@ import { LRUCache } from "lru-cache";
 import config from "@/config";
 import { errorToString } from "@/helpers/errorToString";
 import logger from "@/lib/logger";
-import redis from "@/lib/redis";
+import { getDb } from "@/lib/mongodb";
 
 export interface AuthData {
   role: "user" | "admin";
@@ -41,15 +41,15 @@ export const authMiddleware = (app: Elysia) =>
           return { auth: cached, apiKeyHash };
         }
 
-        const key = `${REDIS_KEY_PREFIX}:${apiKey}`;
-        const raw = await redis.get(key);
+        const db = getDb();
+        const doc = await db.collection("api_keys").findOne({ key: apiKey });
 
-        if (!raw) {
+        if (!doc) {
           logger.warn("Invalid API key attempted: %s", apiKeyHash);
           return { auth: null, apiKeyHash: null as string | null };
         }
 
-        const auth = JSON.parse(raw) as AuthData;
+        const auth: AuthData = { role: doc.role };
         apiKeyCache.set(apiKey, auth);
         return { auth, apiKeyHash };
       } catch (error) {

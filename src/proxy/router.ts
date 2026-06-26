@@ -7,7 +7,7 @@ import { mediaOwnerKey } from "@/cluster/keys";
 import { getLease } from "@/cluster/leaseStore";
 import { errorToString } from "@/helpers/errorToString";
 import logger from "@/lib/logger";
-import redis from "@/lib/redis";
+import { getDb } from "@/lib/mongodb";
 import {
   type ForwardableRequest,
   forwardRequest,
@@ -193,7 +193,11 @@ export async function forwardMediaRequest(
   messageId: string,
   rawRequest: Request,
 ): Promise<Response> {
-  const ownerId = await redis.get(mediaOwnerKey(messageId));
+  const db = getDb();
+  const doc = await db
+    .collection<{ _id: string; owner: string }>("media_owners")
+    .findOne({ _id: messageId });
+  const ownerId = doc ? doc.owner : null;
   if (!ownerId) {
     return notFound("File not found");
   }
