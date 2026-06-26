@@ -10,6 +10,7 @@
   "license": "MIT",
   "main": "src/index.ts",
   "module": "src/index.ts",
+  "type": "module",
   "scripts": {
     "dev": "bun --watch src/index.ts",
     "test": "bun test --coverage",
