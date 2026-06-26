@@ -87,7 +87,7 @@ describe("BaileysConnection", () => {
   });
 
   describe("constructor", () => {
-    it("sets default values for optional parameters", () => {
+    it("1sets default values for optional parameters", () => {
       const conn = new BaileysConnection("+5511999", {
         webhookUrl: "https://hook.com",
         webhookVerifyToken: "token",
