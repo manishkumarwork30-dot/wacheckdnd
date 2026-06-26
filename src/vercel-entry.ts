@@ -1,9 +1,7 @@
 import app from "./app";
 
-export default {
-  async fetch(request: Request): Promise<Response> {
-    return app.handle(request);
-  }
-};
+export default async function handler(request: Request): Promise<Response> {
+  return app.handle(request);
+}
 
 

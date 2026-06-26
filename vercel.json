@@ -2,11 +2,11 @@
   "rewrites": [
     {
       "source": "/(.*)",
-      "destination": "/api/handler.ts"
+      "destination": "/api/index.mjs"
     }
   ],
   "functions": {
-    "api/handler.ts": {
+    "api/index.mjs": {
       "runtime": "nodejs20.x"
     }
   }
