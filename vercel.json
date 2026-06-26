@@ -2,7 +2,7 @@
   "version": 2,
   "builds": [
     {
-      "src": "src/vercel-entry.ts",
+      "src": "api/index.mjs",
       "use": "@vercel/node",
       "config": {
         "maxDuration": 300,
@@ -11,7 +11,7 @@
     }
   ],
   "routes": [
-    { "src": "/(.*)", "dest": "src/vercel-entry.ts" }
+    { "src": "/(.*)", "dest": "api/index.mjs" }
   ],
   "env": {
     "REDIS_URL": "",
