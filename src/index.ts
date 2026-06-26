@@ -37,6 +37,12 @@ const mediaCleanup = new MediaCleanupService({
 });
 
 const bootstrap = async () => {
+  // If running in serverless deployment on Vercel, bypass full standalone TCP server listen loop
+  if (process.env.VERCEL) {
+    console.log("Running in Vercel serverless context. Exiting startup listeners.");
+    return;
+  }
+
   // Redis must be up before the HTTP listener opens — a worker serving
   // requests without coordination guarantees would hold sockets it can never
   // lease, and the proxy cannot resolve routes at all. Fail fast instead.
@@ -81,6 +87,7 @@ const bootstrap = async () => {
 
 void bootstrap();
 
+
 let shuttingDown = false;
 const shutdown = async (signal: string) => {
   if (shuttingDown) {
@@ -122,3 +129,6 @@ const shutdown = async (signal: string) => {
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
+
+export default server;
+

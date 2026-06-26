@@ -1,5 +1,4 @@
 import cors from "@elysiajs/cors";
-import swagger from "@elysiajs/swagger";
 import Elysia from "elysia";
 import config from "@/config";
 import adminController from "@/controllers/admin";
@@ -44,75 +43,86 @@ const app = new Elysia()
       default:
     }
   })
-  .use(
-    swagger({
-      documentation: {
-        info: {
-          title: config.packageInfo.name,
-          version: config.packageInfo.version,
-          description: `${config.packageInfo.description} [See on GitHub](${config.packageInfo.repository.url})`,
-        },
-        servers: [
-          {
-            url: `http://localhost:${config.port}`,
-            description: "Local development server",
-          },
-          {
-            url: "{scheme}://{customUrl}",
-            description: "Custom server",
-            variables: {
-              scheme: {
-                enum: ["http", "https"],
-                default: "https",
-                description: "HTTP or HTTPS",
-              },
-              customUrl: {
-                default: "your-domain.com",
-                description: "Your API domain (without protocol)",
-              },
-            },
-          },
-        ],
-        tags: [
-          {
-            name: "Status",
-            description: "Fetch server status",
-          },
-          {
-            name: "Connections",
-            description: "WhatsApp connections operations",
-          },
-          {
-            name: "Admin",
-            description: "Admin operations",
-          },
-          {
-            name: "Media",
-            description: "Retrieve media content from a message",
-          },
-          {
-            name: "Cluster",
-            description: "Instance health and cluster identity",
-          },
-        ],
-        components: {
-          securitySchemes: {
-            xApiKey: {
-              type: "apiKey",
-              in: "header",
-              name: "x-api-key",
-              description: "API key. See scripts/manage-api-keys.ts",
-            },
-          },
-        },
-      },
-    }),
-  )
   .use(statusController)
   .use(adminController)
   .use(connectionsController)
   .use(mediaController)
   .use(clusterController);
+
+if (!process.env.VERCEL) {
+  try {
+    const swaggerModule = "@elysiajs/swagger";
+    const swagger = require(swaggerModule).default || require(swaggerModule).swagger;
+    if (swagger) {
+      app.use(
+        swagger({
+          documentation: {
+            info: {
+              title: config.packageInfo.name,
+              version: config.packageInfo.version,
+              description: `${config.packageInfo.description} [See on GitHub](${config.packageInfo.repository.url})`,
+            },
+            servers: [
+              {
+                url: `http://localhost:${config.port}`,
+                description: "Local development server",
+              },
+              {
+                url: "{scheme}://{customUrl}",
+                description: "Custom server",
+                variables: {
+                  scheme: {
+                    enum: ["http", "https"],
+                    default: "https",
+                    description: "HTTP or HTTPS",
+                  },
+                  customUrl: {
+                    default: "your-domain.com",
+                    description: "Your API domain (without protocol)",
+                  },
+                },
+              },
+            ],
+            tags: [
+              {
+                name: "Status",
+                description: "Fetch server status",
+              },
+              {
+                name: "Connections",
+                description: "WhatsApp connections operations",
+              },
+              {
+                name: "Admin",
+                description: "Admin operations",
+              },
+              {
+                name: "Media",
+                description: "Retrieve media content from a message",
+              },
+              {
+                name: "Cluster",
+                description: "Instance health and cluster identity",
+              },
+            ],
+            components: {
+              securitySchemes: {
+                xApiKey: {
+                  type: "apiKey",
+                  in: "header",
+                  name: "x-api-key",
+                  description: "API key. See scripts/manage-api-keys.ts",
+                },
+              },
+            },
+          },
+        }),
+      );
+    }
+  } catch (err) {
+    logger.error("Failed to load swagger: %s", errorToString(err as Error));
+  }
+}
 
 if (config.env === "development") {
   app.use(cors());

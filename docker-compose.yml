@@ -1,0 +1,67 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:6.0
+    container_name: whatsapp-scanner-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    restart: always
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:8-alpine
+    container_name: whatsapp-scanner-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --appendfsync everysec
+    volumes:
+      - redis-data:/data
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  baileys-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: whatsapp-scanner-api
+    ports:
+      - "3000:3000"
+    command: ["bun", "start"]
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - LOG_LEVEL=info
+      - BAILEYS_LOG_LEVEL=warn
+      - REDIS_URL=redis://redis:6379
+      - IGNORE_GROUP_MESSAGES=true
+      - IGNORE_STATUS_MESSAGES=true
+      - IGNORE_BROADCAST_MESSAGES=true
+      - IGNORE_NEWSLETTER_MESSAGES=true
+      - IGNORE_BOT_MESSAGES=true
+      - IGNORE_META_AI_MESSAGES=true
+      - MEDIA_CLEANUP_ENABLED=true
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - api-logs:/usr/src/app/logs
+      - api-media:/usr/src/app/media
+    restart: always
+    stop_grace_period: 45s
+
+volumes:
+  mongo-data:
+  redis-data:
+  api-logs:
+  api-media:
