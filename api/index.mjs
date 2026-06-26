@@ -161,7 +161,7 @@ var config = {
     )
   },
   mongo: {
-    url: MONGO_URL || "mongodb://localhost:27017"
+    url: MONGO_URL || process.env.MONGODB_URI || "mongodb://localhost:27017"
   },
   webhook: {
     retryPolicy: {
@@ -510,7 +510,7 @@ var db = null;
 async function initializeMongo() {
   if (db)
     return db;
-  const mongoUrl = process.env.MONGO_URL || "mongodb://localhost:27017";
+  const mongoUrl = process.env.MONGO_URL || process.env.MONGODB_URI || "mongodb://localhost:27017";
   const dbName = "verification_db";
   logger_default.info("Connecting to MongoDB...");
   client = new MongoClient(mongoUrl);

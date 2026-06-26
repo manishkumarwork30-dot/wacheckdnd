@@ -8,7 +8,10 @@ let db: Db | null = null;
 export async function initializeMongo(): Promise<Db> {
   if (db) return db;
 
-  const mongoUrl = process.env.MONGO_URL || "mongodb://localhost:27017";
+  const mongoUrl =
+    process.env.MONGO_URL ||
+    process.env.MONGODB_URI ||
+    "mongodb://localhost:27017";
   const dbName = "verification_db"; // You can make this configurable via config if needed
 
   logger.info("Connecting to MongoDB...");
