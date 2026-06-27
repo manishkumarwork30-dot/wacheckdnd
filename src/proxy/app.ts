@@ -20,7 +20,11 @@ import {
 //
 // API keys are checked at the proxy too (cheap, bounces invalid traffic
 // before it touches workers), and again at the workers — defense in depth.
-const proxyApp = new Elysia()
+import { node } from "@elysiajs/node";
+
+const proxyApp = new Elysia({
+  adapter: typeof Bun === "undefined" ? node() : undefined
+})
   .onAfterResponse(({ request, response, set }) => {
     // Path only: the phone number is this codebase's log correlation key
     // (workers log it on every connection line), but query strings carry

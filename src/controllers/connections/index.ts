@@ -88,6 +88,62 @@ const connectionsController = new Elysia({
       throw e;
     }
   })
+  .get(
+    "",
+    () => {
+      return { data: baileys.getActivePhoneNumbers() };
+    },
+    {
+      detail: {
+        description: "List all active connection JIDs/phone numbers on this instance",
+        responses: {
+          200: {
+            description: "List of active phone numbers",
+            content: {
+              "application/json": {
+                schema: t.Object({
+                  data: t.Array(t.String()),
+                }),
+              },
+            },
+          },
+        },
+      },
+    }
+  )
+  .get(
+    "/:phoneNumber/qr",
+    async ({ params, set }) => {
+      const { phoneNumber } = params;
+      const qr = baileys.getLastQR(phoneNumber);
+      if (!qr) {
+        set.status = 404;
+        return { error: "Not Found", message: "No QR code available for this session. It might already be connected or not started." };
+      }
+      return { qr };
+    },
+    {
+      params: phoneNumberParams,
+      detail: {
+        description: "Get the latest QR code data URL for a connecting session",
+        responses: {
+          200: {
+            description: "QR code data URL",
+            content: {
+              "application/json": {
+                schema: t.Object({
+                  qr: t.String(),
+                }),
+              },
+            },
+          },
+          404: {
+            description: "No QR code found",
+          },
+        },
+      },
+    }
+  )
   .post(
     "/:phoneNumber",
     async ({ params, body, apiKeyHash, set }) => {

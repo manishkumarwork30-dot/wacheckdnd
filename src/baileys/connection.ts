@@ -143,6 +143,7 @@ export class BaileysConnection {
   private isDiscarded = false;
   private _inFlightWebhooks = 0;
   private leaseEpoch: number | null = null;
+  private lastQRDataUrl: string | null = null;
   // Monotonic timestamp of the last message-level traffic (received message,
   // outgoing send, receipt update). null = no traffic since this connection
   // object was created. Drives idle-aware handoff in the coordinator.
@@ -189,6 +190,10 @@ export class BaileysConnection {
 
   get lastTrafficAt(): number | null {
     return this._lastTrafficAt;
+  }
+
+  getLastQR(): string | null {
+    return this.lastQRDataUrl;
   }
 
   private markTraffic() {
@@ -902,9 +907,11 @@ export class BaileysConnection {
     }
 
     if (qr) {
+      const qrData = await toDataURL(qr);
+      this.lastQRDataUrl = qrData;
       Object.assign(data, {
         connection: "connecting",
-        qrDataUrl: await toDataURL(qr),
+        qrDataUrl: qrData,
       });
     }
 
@@ -913,6 +920,7 @@ export class BaileysConnection {
     }
 
     if (data.connection === "open") {
+      this.lastQRDataUrl = null;
       this.reconnectCount = 0;
       this.startGroupActivityFlush();
     }

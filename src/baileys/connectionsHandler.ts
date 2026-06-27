@@ -49,6 +49,10 @@ export class BaileysConnectionsHandler {
     return Object.keys(this.connections);
   }
 
+  getLastQR(phoneNumber: string): string | null {
+    return this.connections[phoneNumber]?.getLastQR() ?? null;
+  }
+
   get size(): number {
     return Object.keys(this.connections).length;
   }

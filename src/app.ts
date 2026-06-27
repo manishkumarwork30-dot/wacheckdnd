@@ -9,7 +9,15 @@ import statusController from "@/controllers/status";
 import { errorToString } from "@/helpers/errorToString";
 import logger, { deepSanitizeObject } from "@/lib/logger";
 
-const app = new Elysia()
+import { node } from "@elysiajs/node";
+import { dashboardHtml } from "@/public/dashboard";
+
+const app = new Elysia({
+  adapter: typeof Bun === "undefined" ? node() : undefined
+})
+  .get("/", () => new Response(dashboardHtml, {
+    headers: { "Content-Type": "text/html" }
+  }))
   .onAfterResponse(({ request, response, set }) => {
     if (config.env === "development") {
       logger.info(
