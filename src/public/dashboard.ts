@@ -390,6 +390,7 @@ export const dashboardHtml = `<!DOCTYPE html>
     <div class="api-key-section">
       <input type="password" id="apiKeyInput" placeholder="Enter x-api-key" />
       <button onclick="saveApiKey()">Save Key</button>
+      <button onclick="handleLogout()" style="background: var(--danger);">Logout</button>
     </div>
   </header>
 
@@ -419,15 +420,20 @@ export const dashboardHtml = `<!DOCTYPE html>
         <label for="newVerifyToken">Webhook Verify Token</label>
         <input type="text" id="newVerifyToken" value="verify_token_123456" />
       </div>
+      <div class="form-group" style="flex-direction: row; align-items: center; gap: 0.5rem; margin: 0.25rem 0 0.75rem 0;">
+        <input type="checkbox" id="usePairingCodeCheckbox" style="width: auto; cursor: pointer;" />
+        <label for="usePairingCodeCheckbox" style="cursor: pointer; font-size: 0.9rem; color: var(--text-main); font-weight: 500;">Link with Pairing Code (Easy Method)</label>
+      </div>
       <button id="connectBtn" onclick="createConnection()">Create & Connect</button>
       
-      <!-- QR code display if connecting -->
+      <!-- QR code/Pairing code display if connecting -->
       <div id="qrSection" style="display: none; flex-direction: column; gap: 1rem; align-items: center; margin-top: 1rem;">
-        <p style="font-weight: 500; font-size: 0.95rem; color: var(--warning);">Scan this QR Code in WhatsApp Linked Devices:</p>
-        <div class="qr-container">
+        <p id="authInstruction" style="font-weight: 500; font-size: 0.95rem; color: var(--warning); text-align: center;">Scan this QR Code in WhatsApp Linked Devices:</p>
+        <div class="qr-container" id="qrContainer">
           <img id="qrImg" src="" alt="WhatsApp QR Code" />
         </div>
-        <p style="font-size: 0.8rem; color: var(--text-muted);">Polling latest QR code...</p>
+        <div id="pairingCodeContainer" style="display: none; font-size: 2.2rem; font-weight: 700; background: rgba(255,255,255,0.07); color: #fff; padding: 1rem 2rem; border-radius: 12px; border: 2px dashed var(--accent); letter-spacing: 0.2rem; text-align: center; text-transform: uppercase;"></div>
+        <p id="pollingStatus" style="font-size: 0.8rem; color: var(--text-muted);">Polling latest connection state...</p>
       </div>
     </div>
 
@@ -445,7 +451,14 @@ export const dashboardHtml = `<!DOCTYPE html>
       </div>
 
       <div class="form-group">
-        <label for="phoneInput">Enter Phone Numbers (One number per line, with country code, e.g. +917012345678 or 917012345678)</label>
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.25rem;">
+          <label for="phoneInput">Enter Phone Numbers (One number per line, with country code, e.g. +917012345678 or 917012345678)</label>
+          <div style="display: flex; gap: 0.5rem; align-items: center;">
+            <button onclick="downloadExampleCSVTemplate()" style="padding: 0.35rem 0.75rem; font-size: 0.8rem; background: var(--accent);">Example CSV</button>
+            <input type="file" id="csvFileInput" accept=".csv" style="display: none;" onchange="handleCSVUpload(event)" />
+            <button onclick="document.getElementById('csvFileInput').click()" style="padding: 0.35rem 0.75rem; font-size: 0.8rem; background: var(--primary);">Upload CSV</button>
+          </div>
+        </div>
         <textarea id="phoneInput" rows="6" placeholder="917012345678&#10;+919988776655&#10;918877665544"></textarea>
       </div>
 
@@ -584,6 +597,7 @@ export const dashboardHtml = `<!DOCTYPE html>
     const phone = document.getElementById("newPhone").value.trim();
     const webhook = document.getElementById("newWebhook").value.trim();
     const verifyToken = document.getElementById("newVerifyToken").value.trim();
+    const usePairingCode = document.getElementById("usePairingCodeCheckbox").checked;
     const connectBtn = document.getElementById("connectBtn");
 
     if (!phone || !webhook || !verifyToken) {
@@ -595,7 +609,7 @@ export const dashboardHtml = `<!DOCTYPE html>
     connectBtn.innerText = "Connecting...";
 
     try {
-      const response = await fetch(\`/connections/\${encodeURIComponent(phone)}\`, {
+      const response = await fetch("/connections/" + encodeURIComponent(phone), {
         method: "POST",
         headers: getHeaders(),
         body: JSON.stringify({
@@ -603,7 +617,8 @@ export const dashboardHtml = `<!DOCTYPE html>
           webhookUrl: webhook,
           webhookVerifyToken: verifyToken,
           includeMedia: false,
-          syncFullHistory: false
+          syncFullHistory: false,
+          usePairingCode: usePairingCode
         })
       });
 
@@ -611,7 +626,7 @@ export const dashboardHtml = `<!DOCTYPE html>
         throw new Error(await response.text() || "Failed to trigger connect");
       }
 
-      // Start polling for QR code
+      // Start polling for QR code / pairing code
       startQRPolling(phone);
 
     } catch (err) {
@@ -623,7 +638,11 @@ export const dashboardHtml = `<!DOCTYPE html>
 
   function startQRPolling(phone) {
     const qrSection = document.getElementById("qrSection");
+    const qrContainer = document.getElementById("qrContainer");
     const qrImg = document.getElementById("qrImg");
+    const pairingCodeContainer = document.getElementById("pairingCodeContainer");
+    const authInstruction = document.getElementById("authInstruction");
+    const pollingStatus = document.getElementById("pollingStatus");
     
     qrSection.style.display = "flex";
     if (qrPollInterval) clearInterval(qrPollInterval);
@@ -633,23 +652,33 @@ export const dashboardHtml = `<!DOCTYPE html>
       pollAttempts++;
       if (pollAttempts > 30) { // stop after 2.5 minutes
         clearInterval(qrPollInterval);
-        alert("QR code polling timed out. Please refresh session state.");
+        alert("Authentication polling timed out. Please refresh session state.");
         resetConnectForm();
         return;
       }
 
       try {
-        const response = await fetch(\`/connections/\${encodeURIComponent(phone)}/qr\`, {
+        const response = await fetch("/connections/" + encodeURIComponent(phone) + "/qr", {
           headers: getHeaders()
         });
 
         if (response.ok) {
           const res = await response.json();
-          if (res.qr) {
+          if (res.pairingCode) {
+            qrContainer.style.display = "none";
+            pairingCodeContainer.style.display = "block";
+            pairingCodeContainer.innerText = res.pairingCode;
+            authInstruction.innerText = "Enter this Pairing Code on WhatsApp (Settings > Linked Devices > Link with Phone Number):";
+            pollingStatus.innerText = "Waiting for you to enter the code on WhatsApp...";
+          } else if (res.qr) {
+            qrContainer.style.display = "block";
+            pairingCodeContainer.style.display = "none";
             qrImg.src = res.qr;
+            authInstruction.innerText = "Scan this QR Code in WhatsApp Linked Devices:";
+            pollingStatus.innerText = "Polling latest QR code...";
           }
         } else if (response.status === 404) {
-          // If QR is 404, check if the session is already active in connection list
+          // If 404, check if the session is already active in connection list
           await fetchSessions();
           if (activePhoneNumbers.includes(phone)) {
             clearInterval(qrPollInterval);
@@ -659,7 +688,7 @@ export const dashboardHtml = `<!DOCTYPE html>
           }
         }
       } catch (err) {
-        console.error("QR poll error:", err);
+        console.error("Auth poll error:", err);
       }
     }, 5000);
   }
@@ -828,7 +857,7 @@ export const dashboardHtml = `<!DOCTYPE html>
   function downloadCSV() {
     if (validationResults.length === 0) return;
     
-    let csvContent = "data:text/csv;charset=utf-8,Phone Number,WhatsApp JID,WhatsApp Active\\n";
+    let csvContent = "data:text/csv;charset=utf-8,Phone Number,WhatsApp JID,WhatsApp Active\n";
     
     validationResults.forEach(r => {
       csvContent += \`\${r.number},\${r.jid},\${r.status}\\n\`;
@@ -841,6 +870,74 @@ export const dashboardHtml = `<!DOCTYPE html>
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+  }
+
+  function downloadExampleCSVTemplate() {
+    const csvContent = "phone\n919876543210\n918765432109\n917654321098\n916543210987\n915432109876";
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.setAttribute("href", url);
+    link.setAttribute("download", "example_numbers.csv");
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
+
+  function handleCSVUpload(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    
+    const reader = new FileReader();
+    reader.onload = function(e) {
+      const text = e.target.result;
+      const lines = text.split(/\r?\n/);
+      if (lines.length === 0) return;
+      
+      const header = lines[0].split(",");
+      let colIndex = 0;
+      
+      const phoneHeaderIndex = header.findIndex(h => h.trim().toLowerCase().includes("phone") || h.trim().toLowerCase().includes("number"));
+      if (phoneHeaderIndex !== -1) {
+        colIndex = phoneHeaderIndex;
+      }
+      
+      const numbers = [];
+      const startRow = (phoneHeaderIndex !== -1 || isNaN(header[0].trim().replace(/[+\s-]/g, ""))) ? 1 : 0;
+      
+      for (let i = startRow; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        const cols = line.split(",");
+        if (cols[colIndex]) {
+          const num = cols[colIndex].trim().replace(/["]/g, "");
+          if (num) numbers.push(num);
+        }
+      }
+      
+      if (numbers.length > 0) {
+        document.getElementById("phoneInput").value = numbers.join("\n");
+        alert("Loaded " + numbers.length + " numbers from CSV file!");
+      } else {
+        alert("No numbers found in the CSV file.");
+      }
+      
+      event.target.value = "";
+    };
+    reader.readAsText(file);
+  }
+
+  async function handleLogout() {
+    try {
+      const response = await fetch("/auth/logout", { method: "POST" });
+      if (response.ok) {
+        window.location.reload();
+      } else {
+        alert("Logout failed");
+      }
+    } catch (err) {
+      alert("Error logging out: " + err.message);
+    }
   }
 </script>
 

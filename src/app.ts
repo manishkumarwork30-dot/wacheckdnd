@@ -10,14 +10,22 @@ import { errorToString } from "@/helpers/errorToString";
 import logger, { deepSanitizeObject } from "@/lib/logger";
 
 import { node } from "@elysiajs/node";
-import { dashboardHtml } from "@/public/dashboard";
+import { dashboardHtml } from "./public/dashboard";
+import { loginHtml } from "./public/login";
+import authController from "./controllers/auth";
 
 const app = new Elysia({
   adapter: typeof Bun === "undefined" ? node() : undefined
 })
-  .get("/", () => new Response(dashboardHtml, {
-    headers: { "Content-Type": "text/html" }
-  }))
+  .use(authController)
+  .get("/", ({ request }) => {
+    const cookieHeader = request.headers.get("cookie") || "";
+    const isLoggedIn = cookieHeader.includes("session=admin_logged_in");
+    const html = isLoggedIn ? dashboardHtml : loginHtml;
+    return new Response(html, {
+      headers: { "Content-Type": "text/html" }
+    });
+  })
   .onAfterResponse(({ request, response, set }) => {
     if (config.env === "development") {
       logger.info(

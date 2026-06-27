@@ -116,29 +116,31 @@ const connectionsController = new Elysia({
     async ({ params, set }) => {
       const { phoneNumber } = params;
       const qr = baileys.getLastQR(phoneNumber);
-      if (!qr) {
+      const pairingCode = baileys.getLastPairingCode(phoneNumber);
+      if (!qr && !pairingCode) {
         set.status = 404;
-        return { error: "Not Found", message: "No QR code available for this session. It might already be connected or not started." };
+        return { error: "Not Found", message: "No QR code or pairing code available for this session. It might already be connected or not started." };
       }
-      return { qr };
+      return { qr, pairingCode };
     },
     {
       params: phoneNumberParams,
       detail: {
-        description: "Get the latest QR code data URL for a connecting session",
+        description: "Get the latest QR code data URL or pairing code for a connecting session",
         responses: {
           200: {
-            description: "QR code data URL",
+            description: "QR code data URL or pairing code",
             content: {
               "application/json": {
                 schema: t.Object({
-                  qr: t.String(),
+                  qr: t.Optional(t.String()),
+                  pairingCode: t.Optional(t.String()),
                 }),
               },
             },
           },
           404: {
-            description: "No QR code found",
+            description: "No QR code or pairing code found",
           },
         },
       },
@@ -212,6 +214,12 @@ const connectionsController = new Elysia({
           t.Boolean({
             description:
               "Automatically subscribe to presence updates when sending/receiving messages or typing status to/from a contact. Subscriptions are ephemeral and re-established automatically.",
+            default: false,
+          }),
+        ),
+        usePairingCode: t.Optional(
+          t.Boolean({
+            description: "Whether to request pairing code instead of generating QR code",
             default: false,
           }),
         ),

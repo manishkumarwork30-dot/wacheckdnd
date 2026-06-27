@@ -53,6 +53,10 @@ export class BaileysConnectionsHandler {
     return this.connections[phoneNumber]?.getLastQR() ?? null;
   }
 
+  getLastPairingCode(phoneNumber: string): string | null {
+    return this.connections[phoneNumber]?.getLastPairingCode() ?? null;
+  }
+
   get size(): number {
     return Object.keys(this.connections).length;
   }

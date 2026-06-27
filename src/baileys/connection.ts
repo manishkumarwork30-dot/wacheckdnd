@@ -144,6 +144,8 @@ export class BaileysConnection {
   private _inFlightWebhooks = 0;
   private leaseEpoch: number | null = null;
   private lastQRDataUrl: string | null = null;
+  private lastPairingCode: string | null = null;
+  private usePairingCode: boolean;
   // Monotonic timestamp of the last message-level traffic (received message,
   // outgoing send, receipt update). null = no traffic since this connection
   // object was created. Drives idle-aware handoff in the coordinator.
@@ -178,6 +180,7 @@ export class BaileysConnection {
     this.autoPresenceSubscribe = options.autoPresenceSubscribe ?? false;
     this._apiKeyHash = options.apiKeyHash ?? null;
     this.leaseEpoch = options.leaseEpoch ?? null;
+    this.usePairingCode = !!options.usePairingCode;
   }
 
   get apiKeyHash(): string | null {
@@ -194,6 +197,10 @@ export class BaileysConnection {
 
   getLastQR(): string | null {
     return this.lastQRDataUrl;
+  }
+
+  getLastPairingCode(): string | null {
+    return this.lastPairingCode;
   }
 
   private markTraffic() {
@@ -238,6 +245,7 @@ export class BaileysConnection {
 
     this.autoPresenceSubscribe = options.autoPresenceSubscribe ?? false;
     this._apiKeyHash = options.apiKeyHash ?? this._apiKeyHash;
+    this.usePairingCode = options.usePairingCode ?? this.usePairingCode;
     // A reused connection may have been re-leased under a newer epoch (e.g. a
     // force-acquire on POST /connections); stale epochs would get the
     // webhooks discarded by the client.
@@ -260,6 +268,7 @@ export class BaileysConnection {
       groupsEnabled: this.groupsEnabled,
       autoPresenceSubscribe: this.autoPresenceSubscribe,
       apiKeyHash: this._apiKeyHash,
+      usePairingCode: this.usePairingCode,
     });
   }
 
@@ -343,6 +352,25 @@ export class BaileysConnection {
     }
 
     this.addEventListeners({ saveCreds });
+
+    if (this.usePairingCode && !state.creds.registered) {
+      setTimeout(async () => {
+        try {
+          const cleanPhone = this.phoneNumber.replace(/[^\d]/g, "");
+          const code = await this.socket?.requestPairingCode(cleanPhone);
+          if (code) {
+            this.lastPairingCode = code;
+            logger.info("[%s] Generated pairing code: %s", this.phoneNumber, code);
+            this.sendToWebhook({
+              event: "connection.update",
+              data: { connection: "connecting", pairingCode: code }
+            });
+          }
+        } catch (err) {
+          logger.error("[%s] requestPairingCode error: %s", this.phoneNumber, errorToString(err));
+        }
+      }, 5000);
+    }
   }
 
   private addEventListeners({ saveCreds }: { saveCreds: () => Promise<void> }) {
@@ -921,6 +949,7 @@ export class BaileysConnection {
 
     if (data.connection === "open") {
       this.lastQRDataUrl = null;
+      this.lastPairingCode = null;
       this.reconnectCount = 0;
       this.startGroupActivityFlush();
     }

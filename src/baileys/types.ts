@@ -14,6 +14,7 @@ export interface BaileysConnectionOptions {
   autoPresenceSubscribe?: boolean;
   apiKeyHash?: string;
   isReconnect?: boolean;
+  usePairingCode?: boolean;
   // Epoch of the lease under which this connection was claimed. Stamped onto
   // connection.update webhooks so the client can discard late events from a
   // previous owner. Threaded in by the coordinator's lease-claim path; never

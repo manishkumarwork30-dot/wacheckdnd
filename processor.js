@@ -40,13 +40,19 @@ async function main() {
     // Verify index exists
     await collection.createIndex({ status: 1 });
 
+    // Get database counts to report proper percentage progress
+    console.log("Fetching database stats...");
+    const totalCount = await collection.countDocuments({});
+    const initialPendingCount = await collection.countDocuments({ status: "pending" });
+    const initialProcessedCount = totalCount - initialPendingCount;
+
     let activeSessionIndex = 0;
     let batchCount = 0;
-    let processedCount = 0;
-    let activeCount = 0;
-    let inactiveCount = 0;
+    let processedCount = initialProcessedCount;
+    let activeCount = await collection.countDocuments({ status: "active" });
+    let inactiveCount = await collection.countDocuments({ status: "inactive" });
 
-    console.log("Starting bulk lookup streams...");
+    console.log(`Starting bulk lookup streams... Total in DB: ${totalCount} | Already processed: ${initialProcessedCount} | Pending: ${initialPendingCount}`);
 
     // Main loop: Query pending numbers in batches
     while (true) {
@@ -126,6 +132,9 @@ async function main() {
           }
         }));
         await collection.bulkWrite(failedOps);
+        processedCount += jids.length;
+        const progressPercent = totalCount > 0 ? ((processedCount / totalCount) * 100).toFixed(2) : "0.00";
+        console.log(`Progress: ${progressPercent}% (${processedCount}/${totalCount}) | Active: ${activeCount} | Inactive: ${inactiveCount}`);
       } else {
         const ops = checkResults.map(result => {
           const phone = result.jid.split("@")[0];
@@ -143,7 +152,8 @@ async function main() {
         // Execute bulk write updates in MongoDB
         await collection.bulkWrite(ops);
         processedCount += jids.length;
-        console.log(`Processed: ${processedCount} | Active: ${activeCount} | Inactive: ${inactiveCount}`);
+        const progressPercent = totalCount > 0 ? ((processedCount / totalCount) * 100).toFixed(2) : "0.00";
+        console.log(`Progress: ${progressPercent}% (${processedCount}/${totalCount}) | Active: ${activeCount} | Inactive: ${inactiveCount}`);
       }
 
       batchCount++;

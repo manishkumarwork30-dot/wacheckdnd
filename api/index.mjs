@@ -8,7 +8,7 @@ var __require = /* @__PURE__ */ ((x) => typeof require !== "undefined" ? require
 
 // src/app.ts
 import cors from "@elysiajs/cors";
-import Elysia6 from "elysia";
+import Elysia7 from "elysia";
 
 // package.json
 var package_default = {
@@ -1125,6 +1125,8 @@ var BaileysConnection = class {
   _inFlightWebhooks = 0;
   leaseEpoch = null;
   lastQRDataUrl = null;
+  lastPairingCode = null;
+  usePairingCode;
   // Monotonic timestamp of the last message-level traffic (received message,
   // outgoing send, receipt update). null = no traffic since this connection
   // object was created. Drives idle-aware handoff in the coordinator.
@@ -1154,6 +1156,7 @@ var BaileysConnection = class {
     this.autoPresenceSubscribe = options.autoPresenceSubscribe ?? false;
     this._apiKeyHash = options.apiKeyHash ?? null;
     this.leaseEpoch = options.leaseEpoch ?? null;
+    this.usePairingCode = !!options.usePairingCode;
   }
   get apiKeyHash() {
     return this._apiKeyHash;
@@ -1166,6 +1169,9 @@ var BaileysConnection = class {
   }
   getLastQR() {
     return this.lastQRDataUrl;
+  }
+  getLastPairingCode() {
+    return this.lastPairingCode;
   }
   markTraffic() {
     this._lastTrafficAt = performance.now();
@@ -1202,6 +1208,7 @@ var BaileysConnection = class {
     }
     this.autoPresenceSubscribe = options.autoPresenceSubscribe ?? false;
     this._apiKeyHash = options.apiKeyHash ?? this._apiKeyHash;
+    this.usePairingCode = options.usePairingCode ?? this.usePairingCode;
     if (options.leaseEpoch !== void 0) {
       this.leaseEpoch = options.leaseEpoch;
     }
@@ -1216,7 +1223,8 @@ var BaileysConnection = class {
       syncFullHistory: this.syncFullHistory,
       groupsEnabled: this.groupsEnabled,
       autoPresenceSubscribe: this.autoPresenceSubscribe,
-      apiKeyHash: this._apiKeyHash
+      apiKeyHash: this._apiKeyHash,
+      usePairingCode: this.usePairingCode
     });
   }
   async connect() {
@@ -1281,6 +1289,24 @@ var BaileysConnection = class {
       return;
     }
     this.addEventListeners({ saveCreds });
+    if (this.usePairingCode && !state.creds.registered) {
+      setTimeout(async () => {
+        try {
+          const cleanPhone = this.phoneNumber.replace(/[^\d]/g, "");
+          const code = await this.socket?.requestPairingCode(cleanPhone);
+          if (code) {
+            this.lastPairingCode = code;
+            logger_default.info("[%s] Generated pairing code: %s", this.phoneNumber, code);
+            this.sendToWebhook({
+              event: "connection.update",
+              data: { connection: "connecting", pairingCode: code }
+            });
+          }
+        } catch (err) {
+          logger_default.error("[%s] requestPairingCode error: %s", this.phoneNumber, errorToString(err));
+        }
+      }, 5e3);
+    }
   }
   addEventListeners({ saveCreds }) {
     const handledEvents = {
@@ -1710,6 +1736,7 @@ var BaileysConnection = class {
     }
     if (data.connection === "open") {
       this.lastQRDataUrl = null;
+      this.lastPairingCode = null;
       this.reconnectCount = 0;
       this.startGroupActivityFlush();
     }
@@ -2096,6 +2123,9 @@ var BaileysConnectionsHandler = class {
   }
   getLastQR(phoneNumber) {
     return this.connections[phoneNumber]?.getLastQR() ?? null;
+  }
+  getLastPairingCode(phoneNumber) {
+    return this.connections[phoneNumber]?.getLastPairingCode() ?? null;
   }
   get size() {
     return Object.keys(this.connections).length;
@@ -3644,29 +3674,31 @@ var connectionsController = new Elysia3({
   async ({ params, set }) => {
     const { phoneNumber } = params;
     const qr = baileys_default.getLastQR(phoneNumber);
-    if (!qr) {
+    const pairingCode = baileys_default.getLastPairingCode(phoneNumber);
+    if (!qr && !pairingCode) {
       set.status = 404;
-      return { error: "Not Found", message: "No QR code available for this session. It might already be connected or not started." };
+      return { error: "Not Found", message: "No QR code or pairing code available for this session. It might already be connected or not started." };
     }
-    return { qr };
+    return { qr, pairingCode };
   },
   {
     params: phoneNumberParams,
     detail: {
-      description: "Get the latest QR code data URL for a connecting session",
+      description: "Get the latest QR code data URL or pairing code for a connecting session",
       responses: {
         200: {
-          description: "QR code data URL",
+          description: "QR code data URL or pairing code",
           content: {
             "application/json": {
               schema: t2.Object({
-                qr: t2.String()
+                qr: t2.Optional(t2.String()),
+                pairingCode: t2.Optional(t2.String())
               })
             }
           }
         },
         404: {
-          description: "No QR code found"
+          description: "No QR code or pairing code found"
         }
       }
     }
@@ -3733,6 +3765,12 @@ var connectionsController = new Elysia3({
       autoPresenceSubscribe: t2.Optional(
         t2.Boolean({
           description: "Automatically subscribe to presence updates when sending/receiving messages or typing status to/from a contact. Subscriptions are ephemeral and re-established automatically.",
+          default: false
+        })
+      ),
+      usePairingCode: t2.Optional(
+        t2.Boolean({
+          description: "Whether to request pairing code instead of generating QR code",
           default: false
         })
       )
@@ -5749,6 +5787,7 @@ var dashboardHtml = `<!DOCTYPE html>
     <div class="api-key-section">
       <input type="password" id="apiKeyInput" placeholder="Enter x-api-key" />
       <button onclick="saveApiKey()">Save Key</button>
+      <button onclick="handleLogout()" style="background: var(--danger);">Logout</button>
     </div>
   </header>
 
@@ -5778,15 +5817,20 @@ var dashboardHtml = `<!DOCTYPE html>
         <label for="newVerifyToken">Webhook Verify Token</label>
         <input type="text" id="newVerifyToken" value="verify_token_123456" />
       </div>
+      <div class="form-group" style="flex-direction: row; align-items: center; gap: 0.5rem; margin: 0.25rem 0 0.75rem 0;">
+        <input type="checkbox" id="usePairingCodeCheckbox" style="width: auto; cursor: pointer;" />
+        <label for="usePairingCodeCheckbox" style="cursor: pointer; font-size: 0.9rem; color: var(--text-main); font-weight: 500;">Link with Pairing Code (Easy Method)</label>
+      </div>
       <button id="connectBtn" onclick="createConnection()">Create & Connect</button>
       
-      <!-- QR code display if connecting -->
+      <!-- QR code/Pairing code display if connecting -->
       <div id="qrSection" style="display: none; flex-direction: column; gap: 1rem; align-items: center; margin-top: 1rem;">
-        <p style="font-weight: 500; font-size: 0.95rem; color: var(--warning);">Scan this QR Code in WhatsApp Linked Devices:</p>
-        <div class="qr-container">
+        <p id="authInstruction" style="font-weight: 500; font-size: 0.95rem; color: var(--warning); text-align: center;">Scan this QR Code in WhatsApp Linked Devices:</p>
+        <div class="qr-container" id="qrContainer">
           <img id="qrImg" src="" alt="WhatsApp QR Code" />
         </div>
-        <p style="font-size: 0.8rem; color: var(--text-muted);">Polling latest QR code...</p>
+        <div id="pairingCodeContainer" style="display: none; font-size: 2.2rem; font-weight: 700; background: rgba(255,255,255,0.07); color: #fff; padding: 1rem 2rem; border-radius: 12px; border: 2px dashed var(--accent); letter-spacing: 0.2rem; text-align: center; text-transform: uppercase;"></div>
+        <p id="pollingStatus" style="font-size: 0.8rem; color: var(--text-muted);">Polling latest connection state...</p>
       </div>
     </div>
 
@@ -5804,7 +5848,14 @@ var dashboardHtml = `<!DOCTYPE html>
       </div>
 
       <div class="form-group">
-        <label for="phoneInput">Enter Phone Numbers (One number per line, with country code, e.g. +917012345678 or 917012345678)</label>
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.25rem;">
+          <label for="phoneInput">Enter Phone Numbers (One number per line, with country code, e.g. +917012345678 or 917012345678)</label>
+          <div style="display: flex; gap: 0.5rem; align-items: center;">
+            <button onclick="downloadExampleCSVTemplate()" style="padding: 0.35rem 0.75rem; font-size: 0.8rem; background: var(--accent);">Example CSV</button>
+            <input type="file" id="csvFileInput" accept=".csv" style="display: none;" onchange="handleCSVUpload(event)" />
+            <button onclick="document.getElementById('csvFileInput').click()" style="padding: 0.35rem 0.75rem; font-size: 0.8rem; background: var(--primary);">Upload CSV</button>
+          </div>
+        </div>
         <textarea id="phoneInput" rows="6" placeholder="917012345678&#10;+919988776655&#10;918877665544"></textarea>
       </div>
 
@@ -5943,6 +5994,7 @@ var dashboardHtml = `<!DOCTYPE html>
     const phone = document.getElementById("newPhone").value.trim();
     const webhook = document.getElementById("newWebhook").value.trim();
     const verifyToken = document.getElementById("newVerifyToken").value.trim();
+    const usePairingCode = document.getElementById("usePairingCodeCheckbox").checked;
     const connectBtn = document.getElementById("connectBtn");
 
     if (!phone || !webhook || !verifyToken) {
@@ -5954,7 +6006,7 @@ var dashboardHtml = `<!DOCTYPE html>
     connectBtn.innerText = "Connecting...";
 
     try {
-      const response = await fetch(\`/connections/\${encodeURIComponent(phone)}\`, {
+      const response = await fetch("/connections/" + encodeURIComponent(phone), {
         method: "POST",
         headers: getHeaders(),
         body: JSON.stringify({
@@ -5962,7 +6014,8 @@ var dashboardHtml = `<!DOCTYPE html>
           webhookUrl: webhook,
           webhookVerifyToken: verifyToken,
           includeMedia: false,
-          syncFullHistory: false
+          syncFullHistory: false,
+          usePairingCode: usePairingCode
         })
       });
 
@@ -5970,7 +6023,7 @@ var dashboardHtml = `<!DOCTYPE html>
         throw new Error(await response.text() || "Failed to trigger connect");
       }
 
-      // Start polling for QR code
+      // Start polling for QR code / pairing code
       startQRPolling(phone);
 
     } catch (err) {
@@ -5982,7 +6035,11 @@ var dashboardHtml = `<!DOCTYPE html>
 
   function startQRPolling(phone) {
     const qrSection = document.getElementById("qrSection");
+    const qrContainer = document.getElementById("qrContainer");
     const qrImg = document.getElementById("qrImg");
+    const pairingCodeContainer = document.getElementById("pairingCodeContainer");
+    const authInstruction = document.getElementById("authInstruction");
+    const pollingStatus = document.getElementById("pollingStatus");
     
     qrSection.style.display = "flex";
     if (qrPollInterval) clearInterval(qrPollInterval);
@@ -5992,23 +6049,33 @@ var dashboardHtml = `<!DOCTYPE html>
       pollAttempts++;
       if (pollAttempts > 30) { // stop after 2.5 minutes
         clearInterval(qrPollInterval);
-        alert("QR code polling timed out. Please refresh session state.");
+        alert("Authentication polling timed out. Please refresh session state.");
         resetConnectForm();
         return;
       }
 
       try {
-        const response = await fetch(\`/connections/\${encodeURIComponent(phone)}/qr\`, {
+        const response = await fetch("/connections/" + encodeURIComponent(phone) + "/qr", {
           headers: getHeaders()
         });
 
         if (response.ok) {
           const res = await response.json();
-          if (res.qr) {
+          if (res.pairingCode) {
+            qrContainer.style.display = "none";
+            pairingCodeContainer.style.display = "block";
+            pairingCodeContainer.innerText = res.pairingCode;
+            authInstruction.innerText = "Enter this Pairing Code on WhatsApp (Settings > Linked Devices > Link with Phone Number):";
+            pollingStatus.innerText = "Waiting for you to enter the code on WhatsApp...";
+          } else if (res.qr) {
+            qrContainer.style.display = "block";
+            pairingCodeContainer.style.display = "none";
             qrImg.src = res.qr;
+            authInstruction.innerText = "Scan this QR Code in WhatsApp Linked Devices:";
+            pollingStatus.innerText = "Polling latest QR code...";
           }
         } else if (response.status === 404) {
-          // If QR is 404, check if the session is already active in connection list
+          // If 404, check if the session is already active in connection list
           await fetchSessions();
           if (activePhoneNumbers.includes(phone)) {
             clearInterval(qrPollInterval);
@@ -6018,7 +6085,7 @@ var dashboardHtml = `<!DOCTYPE html>
           }
         }
       } catch (err) {
-        console.error("QR poll error:", err);
+        console.error("Auth poll error:", err);
       }
     }, 5000);
   }
@@ -6188,7 +6255,8 @@ var dashboardHtml = `<!DOCTYPE html>
   function downloadCSV() {
     if (validationResults.length === 0) return;
     
-    let csvContent = "data:text/csv;charset=utf-8,Phone Number,WhatsApp JID,WhatsApp Active\\n";
+    let csvContent = "data:text/csv;charset=utf-8,Phone Number,WhatsApp JID,WhatsApp Active
+";
     
     validationResults.forEach(r => {
       csvContent += \`\${r.number},\${r.jid},\${r.status}\\n\`;
@@ -6202,18 +6270,344 @@ var dashboardHtml = `<!DOCTYPE html>
     link.click();
     document.body.removeChild(link);
   }
+
+  function downloadExampleCSVTemplate() {
+    const csvContent = "phone
+919876543210
+918765432109
+917654321098
+916543210987
+915432109876";
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.setAttribute("href", url);
+    link.setAttribute("download", "example_numbers.csv");
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
+
+  function handleCSVUpload(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    
+    const reader = new FileReader();
+    reader.onload = function(e) {
+      const text = e.target.result;
+      const lines = text.split(/\r?
+/);
+      if (lines.length === 0) return;
+      
+      const header = lines[0].split(",");
+      let colIndex = 0;
+      
+      const phoneHeaderIndex = header.findIndex(h => h.trim().toLowerCase().includes("phone") || h.trim().toLowerCase().includes("number"));
+      if (phoneHeaderIndex !== -1) {
+        colIndex = phoneHeaderIndex;
+      }
+      
+      const numbers = [];
+      const startRow = (phoneHeaderIndex !== -1 || isNaN(header[0].trim().replace(/[+s-]/g, ""))) ? 1 : 0;
+      
+      for (let i = startRow; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        const cols = line.split(",");
+        if (cols[colIndex]) {
+          const num = cols[colIndex].trim().replace(/["]/g, "");
+          if (num) numbers.push(num);
+        }
+      }
+      
+      if (numbers.length > 0) {
+        document.getElementById("phoneInput").value = numbers.join("
+");
+        alert("Loaded " + numbers.length + " numbers from CSV file!");
+      } else {
+        alert("No numbers found in the CSV file.");
+      }
+      
+      event.target.value = "";
+    };
+    reader.readAsText(file);
+  }
+
+  async function handleLogout() {
+    try {
+      const response = await fetch("/auth/logout", { method: "POST" });
+      if (response.ok) {
+        window.location.reload();
+      } else {
+        alert("Logout failed");
+      }
+    } catch (err) {
+      alert("Error logging out: " + err.message);
+    }
+  }
 </script>
 
 </body>
 </html>
 `;
 
+// src/public/login.ts
+var loginHtml = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Admin Login - WhatsApp Gateway</title>
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  
+  <style>
+    :root {
+      --bg-gradient: linear-gradient(135deg, #0f172a 0%, #1e1b4b 100%);
+      --card-bg: rgba(30, 41, 59, 0.7);
+      --card-border: rgba(255, 255, 255, 0.08);
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
+      --primary: #10b981;
+      --primary-hover: #059669;
+      --primary-glow: rgba(16, 185, 129, 0.15);
+      --accent: #6366f1;
+      --danger: #ef4444;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      font-family: 'Outfit', sans-serif;
+    }
+
+    body {
+      background: var(--bg-gradient);
+      color: var(--text-main);
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      padding: 1rem;
+    }
+
+    .login-container {
+      max-width: 420px;
+      width: 100%;
+      background: var(--card-bg);
+      backdrop-filter: blur(16px);
+      border: 1px solid var(--card-border);
+      border-radius: 20px;
+      padding: 2.5rem;
+      box-shadow: 0 12px 40px 0 rgba(0, 0, 0, 0.4);
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+    }
+
+    .header {
+      text-align: center;
+    }
+
+    h1 {
+      font-size: 1.8rem;
+      font-weight: 600;
+      background: linear-gradient(to right, #10b981, #6366f1);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin-bottom: 0.5rem;
+    }
+
+    .subtitle {
+      color: var(--text-muted);
+      font-size: 0.9rem;
+    }
+
+    .form-group {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+    }
+
+    label {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      font-weight: 500;
+    }
+
+    input {
+      background: rgba(15, 23, 42, 0.6);
+      border: 1px solid var(--card-border);
+      color: var(--text-main);
+      padding: 0.85rem 1rem;
+      border-radius: 8px;
+      font-size: 0.95rem;
+      outline: none;
+      transition: all 0.3s ease;
+    }
+
+    input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
+    }
+
+    button {
+      background: var(--primary);
+      color: white;
+      border: none;
+      padding: 0.9rem;
+      border-radius: 8px;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.3s ease;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+      margin-top: 0.5rem;
+    }
+
+    button:hover {
+      background: var(--primary-hover);
+      box-shadow: 0 0 15px var(--primary-glow);
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .error-alert {
+      background: rgba(239, 68, 68, 0.1);
+      color: #fca5a5;
+      border: 1px solid rgba(239, 68, 68, 0.2);
+      padding: 0.75rem 1rem;
+      border-radius: 8px;
+      font-size: 0.85rem;
+      display: none;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="login-container">
+    <div class="header">
+      <h1>\u{1F7E2} Gateway Admin</h1>
+      <p class="subtitle">Please sign in to access the dashboard</p>
+    </div>
+
+    <div class="error-alert" id="errorAlert"></div>
+
+    <form onsubmit="handleLogin(event)" style="display: flex; flex-direction: column; gap: 1.25rem;">
+      <div class="form-group">
+        <label for="email">Email Address</label>
+        <input type="email" id="email" required placeholder="admin@example.com" />
+      </div>
+
+      <div class="form-group">
+        <label for="password">Password</label>
+        <input type="password" id="password" required placeholder="\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022" />
+      </div>
+
+      <button type="submit" id="loginBtn">Sign In</button>
+    </form>
+  </div>
+
+  <script>
+    async function handleLogin(e) {
+      e.preventDefault();
+      const email = document.getElementById("email").value;
+      const password = document.getElementById("password").value;
+      const btn = document.getElementById("loginBtn");
+      const errEl = document.getElementById("errorAlert");
+
+      btn.disabled = true;
+      btn.innerText = "Signing in...";
+      errEl.style.display = "none";
+
+      try {
+        const res = await fetch("/auth/login", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ email, password })
+        });
+
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(text || "Invalid email or password");
+        }
+
+        // Reload the page on successful login so server serves dashboardHtml
+        window.location.reload();
+      } catch (err) {
+        errEl.innerText = err.message;
+        errEl.style.display = "block";
+        btn.disabled = false;
+        btn.innerText = "Sign In";
+      }
+    }
+  </script>
+
+</body>
+</html>
+`;
+
+// src/controllers/auth.ts
+import Elysia6, { t as t4 } from "elysia";
+var authController = new Elysia6({ prefix: "/auth" }).post(
+  "/login",
+  ({ body, set }) => {
+    const { email, password } = body;
+    if (email === "super@admin.com" && password === "Manish@123") {
+      set.headers["Set-Cookie"] = "session=admin_logged_in; Path=/; HttpOnly; Max-Age=86400; SameSite=Lax";
+      return { success: true };
+    }
+    set.status = 401;
+    return "Invalid email or password";
+  },
+  {
+    body: t4.Object({
+      email: t4.String(),
+      password: t4.String()
+    }),
+    detail: {
+      tags: ["Auth"],
+      description: "Admin login endpoint"
+    }
+  }
+).post(
+  "/logout",
+  ({ set }) => {
+    set.headers["Set-Cookie"] = "session=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax";
+    return { success: true };
+  },
+  {
+    detail: {
+      tags: ["Auth"],
+      description: "Admin logout endpoint"
+    }
+  }
+);
+var auth_default = authController;
+
 // src/app.ts
-var app = new Elysia6({
+var app = new Elysia7({
   adapter: typeof Bun === "undefined" ? node() : void 0
-}).get("/", () => new Response(dashboardHtml, {
-  headers: { "Content-Type": "text/html" }
-})).onAfterResponse(({ request, response, set }) => {
+}).use(auth_default).get("/", ({ request }) => {
+  const cookieHeader = request.headers.get("cookie") || "";
+  const isLoggedIn = cookieHeader.includes("session=admin_logged_in");
+  const html = isLoggedIn ? dashboardHtml : loginHtml;
+  return new Response(html, {
+    headers: { "Content-Type": "text/html" }
+  });
+}).onAfterResponse(({ request, response, set }) => {
   if (config_default.env === "development") {
     logger_default.info(
       "%s %s [%d] %o",
